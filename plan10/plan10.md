@@ -1,0 +1,838 @@
+# Physics Compiler MVP — Implementation Plan (for `plan10.md`)
+
+**Normative source:** `plan9.md` = specs v2.2 (§0–§41) + implementation-plan prompt v2.2. References use `plan9.md §N` and `REQ-*` IDs. Module path everywhere: `github.com/PithomLabs/phys`.
+
+---
+
+## 1. Executive architecture
+
+```text
+internal/kernel  ← actual immutable Object/Expr/Kind/Dimension/metadata authority
+       ↑
+core             ← public API/type aliases + package-level façade functions
+       ↑
+ops              ← pure transformations (12 operations, no ledger, no ambient state)
+       ↑
+session          ← ledger/replay/seal authority (imports core, ops, internal/kernel)
+
+mechanics   → core + internal/kernel
+relativity  → core + internal/kernel
+hypothesis  → core + internal/kernel
+```
+
+- **No `core → ops` dependency exists.** `core` declares no operation functions, no ledger, no session types; `core` imports only `internal/kernel` and the standard library. `core` MUST NOT import `ops` or `session` (REQ-004-02).
+- `ops` MUST NOT import `session` (REQ-004-01, no cycles). `session` MAY import `core`, `ops`, `internal/kernel` (plan9 §4).
+- **`session` MUST NOT import `mechanics`, `relativity`, or `hypothesis`.** Domain packages supply objects to the session purely as `core.Object` values; this is asserted by `session_test.go::TestSessionImportIndependence`.
+- **Authority boundaries:**
+  - *Constructor authority (MRC-001):* Go `internal/` visibility + `kernel.MintObject` invariant validation + fixed domain constructors. External/public API boundary only — never claimed as hostile-source protection (REQ-000-04).
+  - *Operation authority (MRC-002..005, 008):* pure `ops` functions, evaluated per call.
+  - *Session authority (MRC-006, 007):* only `session.Session` may commit a ledger, produce `IDENTIFIED`, or mint a `ResearchCandidate`.
+  - *Candidate containment (MRC-008):* enforced in `ops` (status law) and `session` (artifact validation).
+  - *`physvet`:* deferred entirely (REQ-002-15; plan9 §36 records the v0.5 contract only).
+- Concrete backing types for `Object`, `Expr`, `Kind`, `Dimension`, `Assumption`, `AssumptionSet`, `Convention`, `ConventionSet`, `Provenance`, `CorpusStatus` live in `internal/kernel`; `core` exposes only `type X = kernel.X` aliases plus façade constructors/helpers — `core` declares no methods on aliased types (plan9 §4).
+
+## 2. Exact repository tree
+
+```text
+go.mod
+README.md
+
+internal/kernel/
+    types.go
+    mint.go
+
+core/
+    object.go        expr.go       dimension.go  assumption.go  convention.go
+    provenance.go    corpus.go     canonical.go  errors.go
+    object_test.go   expr_test.go
+
+ops/
+    arithmetic.go    simplify.go   transform.go  relation.go     dispatch.go
+    operations_test.go   negative_test.go
+
+session/
+    session.go       ledger.go     research_candidate.go
+    session_test.go
+
+mechanics/
+    primitives.go    relations.go  manifest.json
+    manifest_test.go relations_test.go
+
+relativity/
+    primitives.go    relations.go  manifest.json
+    manifest_test.go derivation_test.go
+
+hypothesis/
+    candidate.go     candidate_test.go
+
+docs/
+    paper-translation.md
+```
+
+Exactly **39 files** including `go.mod` (24 Go source, 10 Go test, 2 JSON manifests, 3 config/doc: `go.mod`, `README.md`, `docs/paper-translation.md`). No convenience, scaffold, generated, or placeholder files (REQ-003-01). Tests are adjacent `*_test.go` only (REQ-003-02). Package assignments (pinned):
+
+| Test file | Go package | Why |
+|---|---|---|
+| `core/object_test.go` | `core_test` (external) | REQ-003-03: visibility/authority assertions (may import `internal/kernel` for fixtures — in-module) |
+| `core/expr_test.go` | `core_test` | public-API round-trips |
+| `ops/operations_test.go`, `ops/negative_test.go` | `ops` | white-box canonicalization detail |
+| `session/session_test.go` | `session_test` (external) | session public surface + replay/tamper/seal |
+| `mechanics/manifest_test.go` | `mechanics` (internal) | reads `go:embed` var without new export surface |
+| `mechanics/relations_test.go` | `mechanics_test` | uses `ops` (test-only edge) |
+| `relativity/manifest_test.go` | `relativity` (internal) | `go:embed` access |
+| `relativity/derivation_test.go` | `relativity_test` | uses `ops` |
+| `hypothesis/candidate_test.go` | `hypothesis_test` | uses `ops`, `session`, `relativity` |
+
+`go.mod` pinned content: `module github.com/PithomLabs/phys` + `go 1.24`, empty require block (REQ-000-01/02).
+
+## 3. Dependency-ordered implementation sequence
+
+Each step: purpose / dependencies / files / result / gate. Gates accumulate; final gate is §13.
+
+**Step 1 — Immutable kernel representation & canonicalization**
+- Purpose: closed `Expr` node set, `Kind`, `Dimension`, metadata value types, structural canonicalization, canonical JSON, SHA-256, defensive-copy accessors.
+- Deps: none (creates `go.mod`).
+- Files: `go.mod`, `internal/kernel/types.go`.
+- Result: `kernel.Expr/Kind/Dimension/Assumption/Convention/Provenance/CorpusStatus/Object` (unexported `Object` fields, accessors, no mint yet); expr/dimension/metadata canonical encoders+decoders; child-sorting (three-key rule); `math/big.Rat` helpers.
+- Gate: `go build ./internal/kernel`.
+
+**Step 2 — Public core façade: expressions, dimensions, metadata, errors**
+- Purpose: aliases, façade constructors, typed errors, expr/metadata equality+hash.
+- Deps: 1.
+- Files: `core/expr.go`, `core/dimension.go`, `core/assumption.go`, `core/convention.go`, `core/provenance.go`, `core/errors.go`, `core/canonical.go` (expr/metadata parts), `core/expr_test.go`.
+- Result: `NewSymbol/NewRational/NewAdd/NewMul/NewNeg/NewPow/NewSqrt/NewCall/NewRelation/NewBranchSet`; nine `Dimension*` constructors; assumption/convention/provenance constructors; 11 typed errors; `EqualExpr/HashExpr/HashAssumptionSet/HashConventionSet/CanonicalExprJSON/ParseExprJSON`.
+- Gate: `go vet ./core && go test ./core` (round-trip, sorting, defensive copies, fixed hash vectors).
+
+**Step 3 — Mint authority & object façade**
+- Purpose: single production mint entry point; object equality/hash; authority negative tests.
+- Deps: 2.
+- Files: `internal/kernel/mint.go`, `core/object.go`, `core/canonical.go` (object part), `core/object_test.go`.
+- Result: `kernel.MintObject(ObjectSpec) (Object, error)` with the 7-point validation contract (plan9 §5.2.1); `core.Object = kernel.Object`; `EqualObject/HashObject`; no `core` forwarder of `MintObject`.
+- Gate: `go test ./core` — zero-object invalid, exact accessor surface, unexported fields (reflect), mint rejects bad specs, AST export-surface scan, import-independence scan.
+
+**Step 4 — Pure arithmetic operations (MRC-002..005, 008 at operation time)**
+- Deps: 3. Files: `ops/arithmetic.go` (+ shared private helpers: validity check, MRC precondition pipeline, assumption/convention merge, provenance result law).
+- Result: `Add, Subtract, Multiply, Divide, Pow` with exact signatures of plan9 §15.1–15.5.
+- Gate: `go build ./ops`.
+
+**Step 5 — Simplify engine**
+- Deps: 4. Files: `ops/simplify.go`.
+- Result: bottom-up recursive simplification: §9.6 identity/rational-`Pow` rules, §9.7 repeated powers, §9.8 `Sqrt` rules gated by bounded entailment, sign normal form, re-sort; `Simplify(x core.Object)`; finiteness predicate (§6 of this plan).
+- Gate: `go build ./ops`.
+
+**Step 6 — Transform operations**
+- Deps: 5. Files: `ops/transform.go`.
+- Result: `Substitute`, `Differentiate` (bounded rules), `Limit` (expansion of fixed `lorentz_factor` body → substitution → simplify).
+- Gate: `go build ./ops`.
+
+**Step 7 — Relation operations**
+- Deps: 5. Files: `ops/relation.go`.
+- Result: `Compare`, `Solve` (pattern-only), `SelectBranch` (narrow).
+- Gate: `go build ./ops`.
+
+**Step 8 — Dispatch + full ops test suite**
+- Deps: 6, 7. Files: `ops/dispatch.go`, `ops/operations_test.go`, `ops/negative_test.go`.
+- Result: `OperationID`, `OperationParams`, `Apply` closed switch over exactly 12 IDs (`identify` rejected); complete positive+negative tests (C, D, E, F, REQ-032-01..07, 18..20).
+- Gate: `go vet ./ops && go test ./ops`.
+
+**Step 9 — Corpus layer**
+- Deps: 3. Files: `core/corpus.go`.
+- Result: `Manifest` typed structs, `ManifestDomain/Limit/Anomaly/Reduction/Item`, `Challenge`, `Review` (plan9 §27: defined in `core/corpus.go`), `ParseManifest/ValidateManifestBytes/CanonicalManifestJSON/Hash` with `encoding/json` strict decoding (`DisallowUnknownFields`), enum validation, canonical-expr decode + byte-canonical re-encode check, **no constructor calls, no I/O**.
+- Gate: `go vet ./core`.
+
+**Step 10 — Mechanics corpus package**
+- Deps: 8, 9. Files: `mechanics/primitives.go` (with `//go:embed manifest.json`), `mechanics/relations.go`, `mechanics/manifest.json`, `mechanics/manifest_test.go`, `mechanics/relations_test.go`.
+- Result: 9 thin wrappers + 3 relation constructors; 11-item manifest in canonical bytes; static `map[string]func() core.Object` cross-check; acceptance **A, B, G**.
+- Gate: `go test ./mechanics`.
+
+**Step 11 — Relativity corpus package**
+- Deps: 8, 9. Files: `relativity/primitives.go` (embed), `relativity/relations.go`, `relativity/manifest.json`, `relativity/manifest_test.go`, `relativity/derivation_test.go`.
+- Result: 8 wrappers + `Velocity` wrapper, 7 fixed constructors, 3 zero constructors, `RestFrameAssumption`; 10-item manifest; cross-check; acceptance **H, I, J** (full §20 sequence, fixed-body limit).
+- Gate: `go test ./relativity`.
+
+**Step 12 — Session core: state machine, draft buffer, steps, Identify**
+- Deps: 8. Files: `session/session.go`, `session/ledger.go`, `session/session_test.go` (first half).
+- Result: nine actions, state machine, `Session.Step` → `ops.Apply`, session-only `Identify`, `Commit` (indices, `step-000001`, genesis hash, `StepEnvelope` chain), `Conclude`, `Validate` (17-step replay), `ParseLedgerJSON`, ledger tamper detection, determinism.
+- Gate: `go vet ./session && go test ./session` (K, Q, R partial).
+
+**Step 13 — ResearchCandidate seal & unverified loader**
+- Deps: 12. Files: `session/research_candidate.go`, remainder of `session/session_test.go`.
+- Result: support types (`FrameworkDependency, Prediction, FalsificationCondition, RecoveryClaim, AnomalyReference` defined in `session`; `Challenge/Review` re-declared as aliases of `core` types), `DraftMetadata`, `Session.Seal`, private seal/validation constructor shared by `Seal` and `UnverifiedResearchCandidate.Validate`, `ParseResearchCandidateJSON` returning only `UnverifiedResearchCandidate`.
+- Gate: `go test ./session` (S, REQ-032-10a, seal-requires-hypothesis, post-seal mutation).
+
+**Step 14 — Hypothesis package**
+- Deps: 13. Files: `hypothesis/candidate.go`, `hypothesis/candidate_test.go`.
+- Result: `NewCandidateConcept` forcing `HYPOTHESIS` + `NONE`, explicit `Kind`/`Dimension`; containment tests; falsifiability + anomaly tests through `Seal`; AST no-promotion/no-forbidden-export scan.
+- Gate: `go test ./hypothesis` (L, M, N, REQ-024-01/02, REQ-032-09/10).
+
+**Step 15 — Documentation**
+- Deps: none (content final after 10–14). Files: `README.md`, `docs/paper-translation.md`.
+- Result: README with module identity, dependency diagram, **constructor authority as external/public API boundary** (REQ-000-04), MRC list + `mrc-v0.4` fallibility (no runtime override), integrity-vs-authenticity statement, non-goals/deferrals; translation doc with exactly `Common notation`, `Framework mapping`, `Ambiguity resolution` sections (plan9 §35).
+- Gate: `go test ./...` (docs-section assertions in `core/object_test.go`).
+
+**Step 16 — End-to-end acceptance**
+- Deps: all. Files: none (verification only).
+- Result: full §13 gate: build, vet, all tests incl. A–S, file-tree audit, import-graph audits, export-surface audits, determinism double-run.
+- Gate: §13.
+
+## 4. Core model implementation
+
+**`internal/kernel/types.go`**
+- `type Expr struct { /* unexported: kind ExprKind; name string; rat *big.Rat; children []Expr; op RelationOperator; functionID string */ }` — immutable handle; zero value invalid (`Valid()==false`).
+- `ExprKind` values pinned by §8.2.1 (`ExprSymbol`..`ExprBranchSet`) with ordinals 0–9; `RelationOperator` (`RelationEq`..`RelationGte`) with canonical strings `eq,neq,lt,lte,gt,gte` (no aliases).
+- `type Kind uint8` with exactly the 18 values of plan9 §6 in listed order (ordinals stable for `mrc-v0.4`), `String()` returning the §6 names (`Mass` … `BranchSet`) — these strings are the manifest/JSON `kind` values.
+- `type Dimension struct { /* [7]*big.Rat exponents M,L,T,I,Θ,N,J, immutable */ }` — every arithmetic returns reduced rationals with positive denominator; `Valid/Equal/Multiply/Divide/Pow(*big.Rat)/CanonicalJSON/Hash` implemented on the kernel type; `core` provides the nine fixed constructors (`Dimensionless()` … `DimensionEnergy()`).
+- Metadata types: `Assumption` (kind, key, closed union `TextValue(string)|ExprValue(Expr)`), `AssumptionSet` (immutable, dedup on exact equality), `Convention{key,value}`, `ConventionSet`, `Provenance{status,source,framework,parentHashes,assumptionHash,conventionHash,mrcVersion,justification}`, `CorpusStatus`.
+- Canonical JSON encoders/decoders for every type (expr forms exactly plan9 §10.2; dimension field order §10.3; rational strings `"1/2"`, integers `"2/1"`; uppercase provenance status; lowercase corpus status and assumption kind; `branch_set` expr kind).
+- Child sorting: (1) node-kind ordinal, (2) lowercase hex SHA-256 child hash via `bytes.Compare`, (3) canonical child bytes via `bytes.Compare`; never maps/pointers/locale.
+- Hashing: SHA-256 over canonical bytes; hex helper lowercase.
+
+**`internal/kernel/mint.go`**
+```go
+type ObjectSpec struct { Name string; Kind Kind; Dimension Dimension; Expr Expr
+    Assumptions AssumptionSet; Conventions ConventionSet; Provenance Provenance; CorpusStatus CorpusStatus }
+func MintObject(spec ObjectSpec) (Object, error)
+```
+- Exactly one production mint entry point (§5.2.1): rejects invalid expr handle; rejects empty name *where the constructor contract requires one* (fixed domain/corpus constructors and hypothesis `id` require names; operation results mint with `Name == ""` — pinned rule); rejects invalid dimension; validates provenance (known status, valid hex parent hashes, `mrcVersion` string, justification only for `IDENTIFIED` or `HYPOTHESIS`-with-justification, `DERIVED` with empty parents permitted for corpus artifacts per §19.6); validates assumption/convention canonicality; normalizes to canonical internal form; returns typed error otherwise.
+- Object canonical JSON field order (§10.4): `schema_version, valid, name, kind, dimension, expr, assumptions, conventions, provenance, corpus_status`; **`schema_version` pinned value: `"1"`** for every artifact schema in MVP (object, ledger, session, candidate, manifest).
+- Replay decoder: `DecodeObjectJSON(data []byte) (Object, error)` — validates canonical round-trip invariant (`Encode(Decode(b)) == b`).
+
+**`core` façade**
+- `core/object.go`: `type Object = kernel.Object`; `EqualObject`, `HashObject`; `Kind`, `CorpusStatus` aliases + constants. Accessors are kernel methods: `Valid/Name/Kind/Dimension/Expr/Assumptions/Conventions/Provenance/CorpusStatus` (REQ-005-09); all return immutable copies (slices/`*big.Rat` defensive copies).
+- `core/expr.go`: `type Expr = kernel.Expr` + the ten `New*` constructors (façade over kernel structural canonicalization) + inspection methods `Valid/Kind/SymbolName/RationalValue/Children/Base/Exponent/FunctionID/Arguments/RelationOperator/Left/Right/BranchTarget/Branches` (kind-guarded; empty/invalid where inapplicable).
+- **Authority boundary mechanics:** `kernel.Object` fields are unexported; outside-module callers cannot import `internal/kernel` (REQ-004-03, Go language rule); `core` re-exports no mint function (REQ-005-04/10); within-module packages (`ops`, `session`, domains, tests) call `kernel.MintObject` and are trusted repository code per REQ-000-03/04. The zero `core.Object{}` is invalid; there are no mutators; validation runs inside `MintObject` before any valid object becomes visible (REQ-005-11).
+- Fixed data pins (all deterministic, no open choices):
+  - Domain primitive names: manifest `name` strings (`mass`, `time`, `position`, `velocity`, `acceleration`, `force`, `momentum`, `energy`, plus relation names `Newton's second law`, `momentum relation`, `kinetic energy relation`; relativity: `spacetime`, `Minkowski metric`, `rest mass`, `energy`, `three-momentum`, `four-momentum`, `speed of light`, `velocity`, `Lorentz factor`, `energy-momentum relation`, `mass-energy relation`, `zero three-momentum`, `zero energy`, `zero velocity`).
+  - Provenance per constructor: status `DEFINED` for fixed corpus constructors except `MassEnergyRelation()` = `DERIVED` (§19.6); `ParentHashes` empty; `Framework` = `classical_mechanics` / `special_relativity`; `Source` pinned per manifest `source` field (see §7); `MRCVersion` = `mrc-v0.4`; `Justification` empty.
+  - `CorpusStatus`: fixed corpus constructors → `ESTABLISHED`; all operation/`Identify` results → `NONE`; candidate concepts → forced `NONE` (§13.4, §24.2).
+
+## 5. MRC implementation map
+
+| Rule | Exact semantic check | Enforcement location | Failure | Test |
+|---|---|---|---|---|
+| MRC-001 Constructor/carrier integrity | Valid object only via allowed §5.4 paths; unexported `kernel.Object` fields; no public generic factory; zero object invalid; `MintObject` invariant validation before visibility | `internal/kernel/mint.go` (validation); `core/object.go` (no forwarder); fixed domain/hypothesis constructors; `ops` outputs; `session` authority; Go `internal/` rule | `InvalidObjectError`, or `ProvenanceError` when a public API rejects a construction path | `core/object_test.go::TestNoGenericFactory`, `TestZeroObjectInvalid`, `TestMintObjectRejectsInvalidSpec`, `TestKernelObjectFieldsUnexported`, `TestInternalKernelBoundary` (external pkg, REQ-003-03) |
+| MRC-002 Dimensional compatibility | Add/Subtract/Compare equal dimensions; Multiply/Divide compose; `Pow` raises by `*big.Rat`; Substitute replacement dim = variable dim; Differentiate dim = target/wrt | `ops/arithmetic.go`, `ops/transform.go`, `ops/relation.go` (precondition pipeline) | `DimensionMismatchError` | `ops/negative_test.go::TestDimensionMismatch` (C), `TestSubstituteDimensionMismatch` |
+| MRC-003 Physical-kind compatibility | Exact §6.2 table: Add/Subtract same named Kind+Dim / Expression+Expression only; Compare per eq-table; inequalities restricted to ordered kinds {Mass,RestMass,Time,Energy,KineticEnergy,SpeedOfLight,Expression}; Multiply/Divide/Pow → `Expression`; Solve input `Relation`/symbol target → `BranchSet`; SelectBranch `BranchSet`+`Relation` | same as MRC-002 | `CategoryMismatchError` | `ops/negative_test.go::TestKindMismatchEqualDimensions` (D), `ops/operations_test.go::TestKindCompatibilityTable` (incl. G's Expression-vs-named path) |
+| MRC-004 Assumption compatibility | Merge = union of inputs + operation + introduced assumptions; identical duplicates dedup; same `(Kind,Key)` different canonical value → conflict | `core/assumption.go` merge used by all `ops` | `AssumptionConflictError` | `ops/negative_test.go::TestAssumptionConflict` (E) |
+| MRC-005 Convention compatibility | Merge conventions; same key different value → conflict | `core/convention.go` merge used by all `ops` | `ConventionConflictError` | `ops/negative_test.go::TestConventionConflict` (F) |
+| MRC-006 Explicit physical identification | Only `Session.Identify`: two valid operands, equal dims, Compare-kind rules, non-empty trimmed justification; logs `Identification` step; `HYPOTHESIS` operand forces `HYPOTHESIS` output | `session/session.go::Identify` (there is no `ops.Identify`; `ops.Apply` rejects `identify`) | `IdentifyError` | `session/session_test.go::TestSessionIdentifyRecords`, `TestIdentifyRequiresJustification` (K, REQ-032-08) |
+| MRC-007 Session/provenance authority | Only `session.Session` commits ledger / seals `ResearchCandidate`; no exported arbitrary-field `Step`/`Ledger` constructors (storage unexported; loader is validation-only) | `session/session.go`, `session/ledger.go`, `session/research_candidate.go` | `ProvenanceError` (also `LedgerValidationError` for structural failures) | `session/session_test.go::TestLedgerConstructionViaSessionOnly`, Q, S (REQ-032-11..14) |
+| MRC-008 Candidate containment | Any op/session result depending on a `HYPOTHESIS` input is `HYPOTHESIS` (transitive); artifact presenting hypothesis-dependent output as trusted fails validation | `ops` provenance law (`arithmetic.go` shared helper, all 12 ops + `Identify`); `session` candidate validation pipeline | `CandidateContainmentError` | `hypothesis/candidate_test.go::TestHypothesisContamination` (L), `TestCandidateArtifactContainmentRejected` (REQ-032-09), S |
+
+Enforcement-layer distinctions: *Go package/internal visibility* = MRC-001 (+REQ-004-03); *trusted mint authority* = `kernel.MintObject` only (MRC-001); *operation-time MRC* = MRC-002/003/004/005/008 inside `ops`; *session authority* = MRC-006/007 inside `session`; *candidate containment at artifact level* = MRC-008 in `session/research_candidate.go`; *`physvet`* = absent from MVP (REQ-002-15), its v0.5 contract recorded only in plan9 §36/§14 of this plan.
+
+## 6. Symbolic engine
+
+**Node set (REQ-008-01):** `Symbol, Rational, Add, Mul, Neg, Pow, Sqrt, Call, Relation, BranchSet` only; ordinals 0–9 stable; forbidden nodes `Derivative, Limit, Function, Arbitrary, Eval, Callback, RawString` do not exist; `Expr` stores no callbacks (REQ-008-02) — assert by reflect type scan.
+
+**Exact arithmetic:** all coefficients/exponents `math/big.Rat`, canonical `num/den` reduced, positive denominator, zero `0/1`; no `float64` anywhere in non-test sources (scan test).
+
+**Constructor-time structural canonicalization only (§9.5/§9.6 preamble):** flatten same-kind `Add`/`Mul`; combine exact rationals (§9.4); sign normal form `Mul(-1,x)→Neg(x)`, `Neg(Rational(q))→Rational(-q)`, `Neg(Neg(x))→x`; deterministic child sort. Semantic rewrites (identities, `0/1` collapse, repeated powers, `Sqrt` rules) belong to `Simplify` — the constructor-vs-`Simplify` boundary is exactly plan9 §41-20.
+
+**Canonical equality/hashing:** `EqualExpr` structural (never display strings); `EqualObject` = byte equality of object canonical JSON (all metadata); SHA-256 over canonical bytes, lowercase hex; deterministic across runs (fixed-vector tests).
+
+**Canonical JSON:** expr forms exactly §10.2 (fixtures assert the literal example bytes); object order §10.4; dimension order §10.3; typed structs only, never `map[string]any`.
+
+**`Simplify` rule set (bottom-up recursive, then re-normalize + re-sort):** §9.6 list: `Add(x,0)→x`, `Add()→0`, `Mul(x,1)→x`, `Mul()→1`, `Mul(x,0)→0` (finiteness gate), `Pow(x,1)→x`, `Neg(Neg(x))→x`, `Sqrt(1)→1`, `Sqrt(0)→0`; exact rational `Pow`: `Pow(Rational(q),n)→Rational(q^n)` for integer `n≥0`; for integer `n<0` when `q≠0`; `Pow(Rational(0),n<0)` → `UnsupportedOperationError`; `Pow(Rational(1),n)→Rational(1)` any exact `n`; `Pow(Rational(0),e>0)→Rational(0)`; `0^0` unsupported (error, never silently valued). §9.7: `x·x→Pow(x,2)`, `Pow(x,2)·Pow(x,2)→Pow(x,4)`, `Pow(Pow(x,a),b)→Pow(x,a·b)` only for nonnegative-integer rational `a,b` — no other power algebra (§9.7-MUST-02). §9.8: `Sqrt(Rational(q))` → exact root only for non-negative perfect-square rationals; `Sqrt(Pow(x,2))→x` only when entailment holds.
+
+**Finiteness predicate (pins §9.6 "finite under current assumptions" — required by the golden limit trace):** `finite(e, A)` = `Rational`→true; `Symbol`→true (primitive physical quantity); `Add/Mul/Neg`→all children finite; `Pow(b,n)` with nonneg-integer `n`→finite(b); `Pow(b,n)` negative-integer `n`→finite(b) ∧ `A` entails `b≠0` (this admits `c^-1` under `c>0`, the only case the MVP derivations need, and satisfies "0 times an expression is accepted only when the expression is finite"); `Sqrt(x)`→`A` entails `x≥0` ∧ finite(x), or `x`∈{Rational 0,1}; `Call`→expand fixed body, then finite; `Relation/BranchSet`→false. `Mul` with a `Rational 0` factor → `0` iff every other factor is finite.
+
+**Bounded differentiation (§15.8):** `Rational→0`; `Symbol→1` if same symbol else `0`; `Add→` termwise; `Mul→` n-ary product rule; `Neg→Neg(d)`; `Pow(base,n)` nonneg-integer rational `n → n·base^(n-1)·d(base)`; result `Simplify`d; `Kind=Expression`; dimension `target/wrt`. Unsupported (`Sqrt, Call, Relation, BranchSet`, non-integer exponent) → `UnsupportedOperationError`. No `Derivative` node is created.
+
+**Limit (§15.9):** if `Call(lorentz_factor, args)` present → replace by fixed body `1 / Sqrt(1 - Pow(v/c, 2))`, substituting the call's argument expressions for parameter symbol `v` (body built with `NewMul(NewRational(1), NewPow(NewSqrt(NewAdd(NewRational(1), NewNeg(NewPow(NewMul(v, NewPow(c,-1)), 2)))), -1))`); then direct substitution of `value` for `variable`'s single symbol; then `Simplify`; singular/unsupported → `UnsupportedOperationError`; result `Kind=Expression`, dimension = target dimension after substitution. **Division representation pinned: `a/b ≡ Mul(a, Pow(b,-1))`** (no division node). The implementation must traverse the body — returning `1` on function-ID match alone is non-conforming (§15.9.1-MUST-02; secondary verification = source audit of `ops/transform.go`).
+
+**Pattern-only `Solve` (§15.11):** accept exactly `Relation(eq, Pow(Symbol(t),2), Expr)` with target object expr a single `Symbol` equal to `t`; return `BranchSet(targetExpr, [Sqrt(rhs), Neg(Sqrt(rhs))])`, kind `BranchSet`, dimension = target dimension; everything else → `UnsupportedOperationError`.
+
+**Narrow `SelectBranch` (§15.12):** validate: operands valid; `branches.Kind()==BranchSet`, `constraint.Kind()==Relation`; branch expr shape `[b, Neg(b)]` (second structurally `Neg` of first); constraint operator `gte`; `constraint.Left() == branches.BranchTarget()`; `constraint.Right()` is `Rational 0`; branch-set dimension == constraint dimension; merge constraint as `Assumption{Kind: Constraint, Key: "selected_branch/"+hex(HashExpr(constraint.Expr())), Value: ExprValue(constraint.Expr())}`; select first branch (structurally nonnegative `Sqrt`), `Simplify` it under merged assumptions; result `Kind=Expression`, dimension = branch-set dimension, provenance preserved subject to contamination. Mass-energy case required: `Sqrt(Pow(Mul(m,Pow(c,2)),2)) → m·c²` because `m≥0` (from `RestMass`) and `Pow(c,2)` is structurally nonnegative (even exponent) per §9.8.
+
+**No CAS/root-finder/prover/parser/function registry:** `Solve` is one pattern; `lorentz_factor` is the sole `function_id`, hard-coded in `ops/transform.go`; entailment is the closed §9.8 rule list ("no other logical inference is permitted"); no source text is ever parsed as mathematics.
+
+## 7. Physics corpus
+
+- **Files:** `mechanics/manifest.json`, `relativity/manifest.json`, embedded via `//go:embed manifest.json` in each package's `primitives.go` (blank `import "embed"`), exposed to tests via the internal test package — no new export surface, no new files.
+- **Canonical file bytes:** each manifest file is byte-identical to `CanonicalManifestJSON(ParseManifest(file))` (compact, struct field order). `Manifest.Hash()` = SHA-256 of those canonical bytes. Tests assert file-bytes == canonical re-encoding (guards drift) and this hash is what callers put in `FrameworkDependency.ManifestHash`.
+- **Strict typed structs:** `core/corpus.go` per plan9 §17.0 (`Manifest`, `ManifestDomain`, `ManifestLimit`, `ManifestAnomaly`, `ManifestReduction`, `ManifestItem`) + `Challenge`, `Review` (§27). Decoding uses `encoding/json` with `DisallowUnknownFields`; missing required fields, unknown fields, unknown enum values, non-canonical `canonical_expr`/`dimension` (must equal their canonical re-encoding), duplicate item IDs, empty `constructor` → `ManifestValidationError`.
+- **`constructor` mapping:** every item carries `constructor` (e.g. `mechanics.NewMass`, `mechanics.NewtonSecondLaw`, `relativity.LorentzFactor`); each manifest test defines the static test-only `map[string]func() core.Object` resolving **every** constructor id; missing entry or unresolvable id fails the test (§17.8). No reflection registry.
+- **Canonical expression decoding:** `ManifestItem.CanonicalExpr` decoded through the kernel expr decoder into the closed node set; `statement` is stored as an opaque string and **never parsed** (§17.6; verified by `TestStatementNotParsed` — a `statement` containing arbitrary math text validates fine, and no non-test file imports `go/parser`/`go/scanner`/`go/token`).
+- **Constructor cross-check (§17.8):** per item resolve constructor → call → compare (1) `canonical_expr` vs `object.Expr()` structurally + by hash, (2) `dimension` vs `object.Dimension()`, (3) `kind` vs `object.Kind()`, (4) `provenance_status` vs `object.Provenance().Status`, (5) `assumptions` vs `object.Assumptions()`, (6) `source` and framework metadata.
+- **Required items:** mechanics 11 (§28.1: Mass, Time, Position, Velocity, Acceleration, Force, Momentum, Energy, NewtonSecondLaw, MomentumRelation, KineticEnergyRelation); relativity 10 (§28.2: Spacetime, MinkowskiMetric, RestMass, Energy, ThreeMomentum, FourMomentum, SpeedOfLight, LorentzFactor, EnergyMomentumRelation, MassEnergyRelation). `KineticEnergy` (parameterized) and `RestFrame` (assumption) are excluded by spec.
+- **Pinned manifest data:** both frameworks `corpus_status: "established"` (loaded, never derived — REQ-013-04); mechanics `framework_id/classical_mechanics`, name `Classical Mechanics`, `domain[1]` (`classical_nonrelativistic`), `limits[1]` (`nonrelativistic_scope`), `anomalies[1]` (`nonrelativistic_regime`, framework `classical_mechanics`, status `scope_limit`); relativity `framework_id/special_relativity`, name `Special Relativity`, `domain[1]`, `limits[1]`, `anomalies[1]` = the exact §19.9 record (`id: no_gravity`, status `scope_limit`); relativity framework `assumptions[4]` (text values: Minkowski spacetime, Lorentz symmetry, No gravitational dynamics in package, Special-relativistic regime; kinds pinned `domain` for scope entries and `physical_assumption` for Lorentz symmetry, keys `minkowski_spacetime`, `lorentz_symmetry`, `no_gravitational_dynamics`, `special_relativistic_regime`); relativity convention recorded on `NewMinkowskiMetric()` and in manifest: `metric.signature = -+++`. `source` pins: `NewtonSecondLaw → "Newton, Principia"`; all other mechanics items → `"Classical Mechanics corpus"`; `EnergyMomentumRelation`, `MassEnergyRelation` → `"Einstein, 1905"`; other relativity items → `"Special Relativity corpus"` (must equal object `Source()` for cross-check).
+- **Item provenance pins:** all items `DEFINED` except `MassEnergyRelation` = `DERIVED` with `derivable_from: ["EnergyMomentumRelation","RestFrame"]` (entries validated as non-empty strings only — `RestFrame` intentionally resolves to no item, so cross-reference existence is NOT checked).
+- **Anomaly/limitation records** are descriptive metadata; no runtime inference (§34.3).
+
+## 8. Assumptions, conventions, provenance, and candidate containment
+
+- **Assumption merge (§11.4):** result = union(inputs) + required operation assumptions + explicitly introduced assumptions; exact duplicates deduplicated; same `(Kind,Key)` with different canonical value → `AssumptionConflictError`. No subsumption/theorem proving.
+- **Denominator precondition (§11.5):** `Divide(a,b)` adds `Assumption{MathPrecondition, "denominator/"+hex(HashExpr(b.Expr())), ExprValue(Compare(b,0,neq))}` — distinct keys per denominator.
+- **Sign assumptions (§11.6):** `RestMass()` carries `Constraint/rest_mass_nonnegative = (m >= 0)`; `SpeedOfLight()` carries `Constraint/speed_of_light_positive = (c > 0)`; merged transitively through operations (so `EnergyMomentumRelation` carries both — §19.5-MUST-02).
+- **Bounded entailment (§9.8, used only for sign/nonzero preconditions):** `Rational q≥0`→nonneg; `Symbol` with explicit `x≥0`→nonneg; explicit `x>0`→positive; `Mul` all factors nonneg→nonneg; `Pow(x, even nonneg integer)`→nonneg; positive-coeff × nonneg factor → nonneg; positive entails nonzero; `EntailsNonZero` additionally accepts a direct structural match of an assumption expr `Relation(neq, e, 0)` (direct reading of an explicit assumption, same style as the explicit `x≥0` read — no derived inference). Nothing else.
+- **Conventions (§12):** `Convention{Key,Value}` non-empty strings; merge conflicts (same key, different value) → `ConventionConflictError`; conventions serialize/hashes participate in object canonical form; no equation may live in a convention string (REQ-012-02 — type system permits only strings).
+- **Provenance propagation law (§13.2) — exact, no invented ordering:** pure `ops` (all 12): any input `HYPOTHESIS` → output `HYPOTHESIS`, else `DERIVED`. `Session.Identify`: any input `HYPOTHESIS` → `HYPOTHESIS`, else `IDENTIFIED`. Assertion actions: `Postulate` requires and records `POSTULATED`; `Define` requires and records `DEFINED`; `Declare` preserves existing status. `APPROXIMATED` exists in the enum but no MVP operation mints it (REQ-013-01). Only `Session.Identify` creates `IDENTIFIED`. `HYPOTHESIS` is never raised to a trusted status by any operation. Source/Framework inheritance (§13.5): preserve iff all inputs identical and non-empty, else empty — purely mechanical.
+- **Corpus status separation:** a distinct human-curated axis (`NONE/ESTABLISHED/CONTESTED/SUPERSEDED/FALSIFIED`, lowercase JSON); loaded from manifests, never computed, never revised at runtime (REQ-013-04); no API produces `PHYSICALLY_TRUE/TRUTH_SCORE/PROBABILITY_OF_TRUTH/BEST_THEORY` (REQ-013-05).
+- **Hypothesis contamination law (MRC-008):** input-level (ops + Identify status law) and artifact-level: candidate validation recomputes provenance per step; any hypothesis-dependent step output presented with a trusted status, any `Hypothesis` field not `HYPOTHESIS`, or any hypothesis-dependent output carrying corpus status ≠ `NONE` → `CandidateContainmentError`. There is no promotion API of any kind.
+
+## 9. Derivation ledger
+
+- **`session.Session`** (state machine, REQ-016-01): `New → Drafting → Committed → Concluded → Sealed`.
+  - Exactly nine actions: `Postulate, Declare, Define, Step, Identify, Conclude, Draft, Commit, Seal` (+ read-only `Validate`, `CanonicalJSON`).
+  - `Draft(derivationID, label, DraftMetadata)` once, `New→Drafting`; `DerivationID` non-empty caller-supplied (deterministic, never generated); records `DerivationID, Label, MRCVersion, GenesisHash`; all slices copied at Draft time; **no separate candidate-metadata mutation methods exist** (§16.2.1).
+  - `Postulate/Declare/Define/Step/Identify` legal only in `Drafting`; `Commit` only in `Drafting` (empty draft → `LedgerValidationError`, state unchanged); `Conclude` only in `Committed`; `Seal` only in `Concluded`; `Validate` legal in every state, never mutates; after `Sealed` every mutation → `ProvenanceError` (REQ-032-22).
+  - Assertion actions record without `ops.Apply`; `Postulate` requires status `POSTULATED` (exercised via `kernel.MintObject` fixture from `session_test` — the single mint path, no second helper), `Define` requires `DEFINED`, `Declare` requires valid and preserves status.
+- **`Session.Step`:** validate state → validate inputs → reject `operation == "identify"` → validate `OperationParams` against op id (`pow`⇒`Exponent` non-empty valid rational; `compare`⇒`Operator` set; `identify`⇒never here; otherwise `Kind=="empty"`) → `ops.Apply` → build canonical step record (inputs, params, output all retained) → append to draft buffer → return result. Callers can never supply their own output for a mechanical operation.
+- **`Session.Identify`:** the only identification API (no `ops.Identify`, no ambient/global session state — REQ-015-01/MRC-006): state check; both objects valid; equal dims; Compare-kind rules; non-empty trimmed justification → else `IdentifyError`; builds `Relation(eq, a.Expr(), b.Expr())`; status `IDENTIFIED` unless contamination; merged assumptions/conventions; justification stored in provenance; appends `Identification` step (params `Kind:"identify"`); returns object.
+- **Draft buffer:** `Step`/`Identify` append fully specified entry material (label, kind, op, canonical inputs, params, canonical output, metadata hashes, status); entries unexported and immutable externally (§16.8).
+- **`Commit`:** freeze buffer in order; indices from 1; `StepID = step-000001`-style (derived solely from index, no UUIDs); first `PreviousStepHash` = 64 lowercase zeros (genesis); compute each `CurrentStepHash`; retain canonical inputs/outputs/params; draft emptied; ledger immutable through public API.
+- **Step fields, exact order (§16.12):** `StepID, Index, Label, StepKind, Operation, InputHashes, InputCanonicals, ParamsCanonical, OutputHash, OutputCanonical, AssumptionHash, ConventionHash, ProvenanceStatus, MRCVersion, PreviousStepHash, CurrentStepHash`. `StepKind ∈ {Assertion, Transformation, Identification}`; assertion operations `postulate|declare|define`; transformation = the 12 `OperationID`s; identification = `identify`. Assertion steps pin: `InputHashes=[h]`, `OutputHash=h`, `OutputCanonical` = same canonical object (retained-object consistency on replay).
+- **`StepEnvelope`:** `CurrentStepHash = SHA256(CanonicalJSON(StepEnvelope{PreviousHash, Step: body}))` where body = all Step fields except `CurrentStepHash` (no self-reference).
+- **Replay substrate:** hashes verify integrity; `InputCanonicals[]` + `OutputCanonical` + `ParamsCanonical` make replay possible (hashes are not invertible — §16.13). Invariants `HashObject(decoded InputCanonical)==InputHash` and same for output are asserted per step.
+- **`Session.Validate` — the exact 17-step ordered pipeline of §16.19**, any mismatch → `LedgerValidationError` (wrapping the specific typed error).
+- **Tamper detection (§16.20):** (1) change only `OutputCanonical` → hash mismatch; (2) also recompute `OutputHash` → current-step hash mismatch; (3) recompute the full chain → replay divergence (re-executed `ops.Apply` output ≠ retained output, unless identical). Tests use `ParseLedgerJSON` (load-as-is, never repairs/recomputes) + `Ledger.Validate`.
+- **Integrity ≠ authenticity:** the SHA-256 chain detects mutation only; anyone rewriting the whole ledger can recompute hashes; signing/authenticity is out of MVP — stated in README and in candidate validation messages; `ResearchCandidate.Validate` explicitly does not treat self-recomputed hashes as authenticity proof (§26.10).
+- **Seal rules:** non-candidate derivations stop at `Concluded` and are checked with `Session.Validate()`; `Seal` requires `DraftMetadata.Hypothesis` valid with status `HYPOTHESIS` (invalid/absent/non-hypothesis → `ProvenanceError`, state stays `Concluded`); before sealing, full validation runs; on success ledger becomes immutable, `DerivationHash` = last step's `CurrentStepHash`, state `Sealed`, `ResearchCandidate` returned.
+- **How replay avoids an import cycle:** ledger/step/replay types live in `session`, which imports `core`, `ops`, and `internal/kernel`. `core` never imports `ops` or `session`, so `ops.Apply` can be re-executed during `session.Validate` without `ops` knowing anything about ledgers. `session` never imports `mechanics/relativity/hypothesis`; replay decodes retained canonical objects through `kernel.DecodeObjectJSON` (mint/decode authority) and feeds them back into `ops.Apply`. Cycle-freedom is verified by `go build ./...` (REQ-004-01) plus `TestSessionImportIndependence`.
+- **External parsing is unverified:** `ParseLedgerJSON` returns a `Ledger` for validation only — it creates no session authority and mints no objects outside the loaded records; `ParseResearchCandidateJSON` returns only `UnverifiedResearchCandidate` (no `core.Object` accessors, never `ResearchCandidate`).
+
+## 10. Hypothesis and ResearchCandidate
+
+- **Candidate concept (`hypothesis.NewCandidateConcept(id, kind, dimension, expr, assumptions, conventions) (core.Object, error)`):** `id` non-empty; `Kind` and `Dimension` explicit and caller-supplied (REQ-024-02), immutable after construction; `expr` valid; provenance **forced** to `HYPOTHESIS` with `Source="hypothesis"`, `Framework=""`, `MRCVersion="mrc-v0.4"`; corpus status **forced** `NONE`; no caller-supplied provenance; no promotion API (REQ-024-01). Mints via `kernel.MintObject`.
+- **Trusted `ResearchCandidate` ownership:** constructed exclusively inside `session`. `Session.Seal()` is the canonical production minting action. `UnverifiedResearchCandidate.Validate()` **delegates to the same unexported sealing/validation constructor** (one private path — no independent trusted-construction logic); `ParseResearchCandidateJSON` performs outer-schema validation only, stores canonical bytes, exposes `CanonicalJSON()` and `Validate()` and **no `core.Object`-returning method** (REQ-032-10a).
+- **Public surface exactly plan9 §26.10** (14 accessors + `Validate` + `CanonicalJSON`; collection accessors return copies; unexported storage; no public struct literal/constructor) + unverified surface exactly as specified.
+- **Validation pipeline (§26.8), in order:** schema → canonicalization → ledger-hash validation → derivation replay (17-step) → provenance/candidate containment → framework-reference integrity (structural only: non-empty framework IDs, 64-hex manifest-hash format, non-empty assumption-hash strings, well-formed anomaly IDs — `session` never imports `mechanics`/`relativity`; manifest/anomaly existence is cross-checked externally in tests) → falsifiability/anomaly field validation (IDs non-empty when entries present; `Review.Challenge.Category` ∈ the eight §27.3 categories). Success = **artifact internal consistency only, never physical truth**.
+- **Containment failures → `CandidateContainmentError`:** `Hypothesis` not `HYPOTHESIS`; hypothesis-dependent derivation output marked trusted (recomputed status ≠ retained, or corpus status ≠ `NONE`); promotion-like internal state claimed.
+- **Falsifiability structures:** `Prediction{ID, Observable, Relation(core.Expr), Assumptions}`, `FalsificationCondition{ID, TargetClaim, ContradictingCondition(core.Expr), Regime}`, `RecoveryClaim{ID, Description, FromFramework, Condition(core.Expr)}`, `AnomalyReference{ID, Framework, Description}` — all typed, deterministic canonical encoders, no dynamic maps; they record research-test structure without any truth/false decision (§25-MUST-01).
+- **Review / Challenge:** data-only types defined in `core/corpus.go` (§27), re-exposed as `session` aliases; categories exactly `CategoryError, DimensionError, AssumptionConflict, ConventionConflict, UnsupportedIdentification, InvalidReduction, ProvenanceProblem, CandidateOverreach`.
+- **External reviewer boundary:** the library defines schemas only — no reviewer selection, orchestration, queues, auto-challenge, or auto-correction (§27.4; deferral row §14). Intended loop: candidate JSON → external reviewer → Review JSON → human.
+- **Candidate fields (canonical order §26.2):** `ID (= Draft DerivationID), Hypothesis, Premises, Assumptions, Derivation (ledger; final hash == LedgerHash), FrameworkDependencies, Predictions, FalsificationConditions, RecoveryClaims, AnomalyReferences, ReviewHistory, MRCVersion, LedgerHash`. `Hypothesis` can never be replaced by a trusted status.
+
+## 11. Canonical vertical slices
+
+Test-function inventory (names are normative for this plan; all A–S map to them):
+
+| Slice (acceptance) | Test function | File |
+|---|---|---|
+| A typed mechanics | `TestTypedMechanicsConstructors` | `mechanics/relations_test.go` |
+| B `F = ma` + manifest agreement | `TestNewtonSecondLawManifestMatch` | `mechanics/manifest_test.go` (+ `TestNewtonSecondLawConstruct` in `relations_test.go`) |
+| C dimension rejection | `TestDimensionMismatch` | `ops/negative_test.go` |
+| D kind rejection | `TestKindMismatchEqualDimensions` | `ops/negative_test.go` |
+| E assumption conflict | `TestAssumptionConflict` | `ops/negative_test.go` |
+| F convention conflict | `TestConventionConflict` | `ops/negative_test.go` |
+| G differentiate `½mv²` | `TestDifferentiateKineticEnergy` | `mechanics/relations_test.go` |
+| H energy-momentum relation | `TestEnergyMomentumRelation` | `relativity/derivation_test.go` |
+| I `E=mc²` derivation | `TestMassEnergyDerivation` | `relativity/derivation_test.go` |
+| J Lorentz limit = 1 | `TestLorentzFactorLimit` | `relativity/derivation_test.go` |
+| K Identify firewall | `TestSimplifyNeverIdentifies` + `TestSessionIdentifyRecords` | `ops/negative_test.go`, `session/session_test.go` |
+| L candidate containment | `TestHypothesisContamination` + `TestCandidateArtifactContainmentRejected` | `hypothesis/candidate_test.go` |
+| M falsifiability | `TestSealedCandidatePreservesFalsifiability` | `hypothesis/candidate_test.go` |
+| N anomaly | `TestCandidateReferencesManifestAnomaly` | `hypothesis/candidate_test.go` |
+| O manifest | `TestMechanicsManifestCrossCheck`, `TestRelativityManifestCrossCheck` | both `manifest_test.go` |
+| P exact rational round-trip | `TestExactRationalRoundTrip` | `core/expr_test.go` |
+| Q ledger tamper/replay | `TestLedgerTamperDetection` | `session/session_test.go` |
+| R determinism | `TestDerivationDeterminism` | `session/session_test.go` |
+| S sealed handoff | `TestSealResearchCandidate` | `session/session_test.go` |
+
+Sequence and required content:
+
+1. **A:** construct all nine mechanics wrappers only via fixed constructors; assert `CoreObject()` exact accessor, kind, dimension, symbol, `DEFINED` provenance, `ESTABLISHED` corpus status.
+2. **B:** `NewtonSecondLaw()` expr canonical bytes equal manifest `canonical_expr` fixture; `F = m*a` relation shape; cross-check (slice O machinery) validates item vs constructor.
+3. **C:** `Add` and `Compare` with mismatched dimensions → `DimensionMismatchError` via `errors.As`; no panic.
+4. **D:** equal-dimension distinct named kinds (e.g. `Energy` vs `Torque`-style fixture — use `KineticEnergy` vs `Momentum`-family fixture built by minting equal-dimension different-kind objects) → `CategoryMismatchError`.
+5. **E:** two valid objects, same `(Constraint,key)`, different structured values → merge → `AssumptionConflictError`.
+6. **F:** conflicting `ConventionSet`s merged by an operation → `ConventionConflictError`.
+7. **G:** `K := mechanics.NewKineticEnergy(m,v)`; `Differentiate(K.CoreObject(), v.CoreObject())` → canonical `m*v`, `Kind=Expression`, dimension Momentum; `Compare(result, NewMomentum().CoreObject(), eq)` accepted (Expression-vs-named, MRC-003 §6.2); exercises product rule + power rule + exact rational simplification.
+8. **H:** `EnergyMomentumRelation()` → canonical expr `E^2 = (p*c)^2 + (m*c^2)^2` (byte fixture), dimension `Energy^2`, assumptions contain `rest_mass_nonnegative` + `speed_of_light_positive`, manifest match.
+9. **I:** the exact §20 sequence with real operations and a session-less ops chain *and* the session-driven variant in `session_test` for S:
+   `construct EnergyMomentumRelation()` → `construct ZeroThreeMomentum()` (carries `RestFrameAssumption`) → `Substitute(rel, ThreeMomentum(), ZeroThreeMomentum())` → `Simplify` → `Solve(…, Energy())` → `Compare(Energy(), ZeroEnergy(), gte)` → `SelectBranch(…, energy_nonnegative)`; assert each golden-trace state (step 2 `E²=(0*c)²+(m c²)²`, step 3 `E²=(m c²)²`, step 4 `BranchSet(E,[Sqrt(…),Neg(Sqrt(…))])`, final `m*c^2` canonical bytes). No hardcoded final result; the test source contains no `MassEnergyRelation()` call (secondary: source audit).
+10. **J:** `Limit(LorentzFactor(), Velocity(), ZeroVelocity())` → exact `1/1`, via body expansion (source audit verifies no ID-match shortcut).
+11. **K:** both sides — `Simplify(x)` never yields `IDENTIFIED` and appends no identification event; `Session.Identify(a,b,justification)` yields `IDENTIFIED`, records justification, records an `Identification` step visible after sealing; `HYPOTHESIS` operand → result `HYPOTHESIS` with attempt preserved.
+12. **L:** create candidate concept → derive with it (Add/Simplify/Solve/Limit/Compare/SelectBranch/Identify) → every downstream status `HYPOTHESIS`; `TestNoForbiddenExportedAPI` (std `go/ast` export scan over the module) proves absence of `Promote, Trust, ApproveHypothesis, PromoteToEstablished, SetCorpusStatus, ApproveException, OverrideMRC, BypassMRC, Integrate, Series, Taylor, Simulate, RankTheories, ScoreTruth`; crafted artifact with hypothesis-dependent trusted output → `CandidateContainmentError`.
+13. **M:** candidate with ≥1 `Prediction`, ≥1 `FalsificationCondition`; `Seal()`; sealed accessors return the same canonical values (round-trip through `CanonicalJSON`).
+14. **N:** `AnomalyReference{ID:"no_gravity", …}`; external cross-check against `relativity/manifest.json` anomalies (test-side, not in `session`).
+15. **O:** both manifests: `go:embed` bytes → `ValidateManifestBytes` → static constructor map resolves every item → all six comparisons → corpus status preserved (`"established"`) → file bytes == `CanonicalManifestJSON`; negative: `TestManifestRejectsInconsistent` (unknown field, bad enum, non-canonical expr, duplicate ID) → `ManifestValidationError` (REQ-032-15).
+16. **P:** expr → canonical JSON → expr byte-identical + equal hash; representative object round-trip through `kernel.DecodeObjectJSON` (`TestObjectCanonicalRoundTrip`, `session_test.go`); `Simplify(Pow(Rational(0),2))→0` and `Simplify(Pow(Rational(1),-1))→1`.
+17. **Q:** all three §16.20 tamper forms + corrupted chain (REQ-032-11..14) detected; each returns `LedgerValidationError` (or wrapped typed error) from `Ledger.Validate` / candidate validation.
+18. **R:** the full §20 derivation executed twice in-process + once through a fresh `Session` → byte-identical canonical artifacts, hashes, ledger JSON, candidate JSON (no hidden ambient state, REQ-015-01).
+19. **S:** full candidate flow: `New → Draft(id,label,metadata{Hypothesis, Premises, Predictions, FalsificationConditions, AnomalyReferences, FrameworkDependencies(manifest hashes computed from canonical manifest bytes), …}) → Define/Declare premises → Step×N (substitute, simplify, solve, compare(gte), select_branch) → Commit → Conclude(final) → Seal` → candidate validates, `LedgerHash == DerivationHash`, `ParseResearchCandidateJSON(candidateJSON).Validate()` round-trips to an equal trusted candidate; negative: `Seal` without hypothesis → `ProvenanceError` state `Concluded`; `Commit` empty → `LedgerValidationError`; post-seal `Step` → `ProvenanceError`; `Conclude` with wrong hash → error.
+
+## 12. Coverage matrix
+
+Conventions: `REQ-§N-MUST-nn` = unnumbered normative clause at spec §N (per plan9 §39). "Secondary" = source/AST/import audit or §13 gate unless noted. Every labeled REQ, every MRC ID, every unnumbered MUST/MUST NOT clause, and acceptance A–S appear.
+
+### 12.1 Module, product boundary, scope (§0–§3)
+
+| Requirement ID | Implementation location | Primary test | Secondary verification |
+|---|---|---|---|
+| REQ-000-01 | `go.mod` | build gate (`go build ./...`) | §13 G-Module: `head go.mod` |
+| REQ-000-02 | `go.mod` (empty require) | `go test ./...` | §13 G-Module: no `require` directives |
+| REQ-000-03 | README §Authority; §1 architecture | S (`TestSealResearchCandidate`) | README human-authority section audit |
+| REQ-000-04 + REQ-§0.3-MUST-01 | README "Constructor authority" (external/public API boundary, not hostile-source) | `core/object_test.go::TestInternalKernelBoundary` | README text audit (no adversarial-protection claim) |
+| REQ-§0.1-MUST-01 (module = `github.com/PithomLabs/phys`) | `go.mod` | build gate (`go build ./...`) | §13 G-Module |
+| REQ-§0.1-MUST-02 (all repo-local imports use `github.com/PithomLabs/phys/...`) | every file import path | §13 G-Imports (AST import audit) | `go list ./...` |
+| REQ-§0.1-MUST-03 (Go standard library only) | `go.mod` empty require | §13 G-Imports (zero third-party in `go list -deps`) | — |
+| REQ-001-01 | `core/`+`ops/` | A, C, D | MRC table §5 |
+| REQ-001-02 | both manifests + domain packages | H, I, J, O | §34 gate (three mechanisms) |
+| REQ-001-03 | `core/corpus.go` + manifests | O | — |
+| REQ-001-04 | metadata types + `session` | A–S (matrix §12.9) | — |
+| REQ-001-05 | no truth APIs anywhere | L, S + `hypothesis_test::TestNoForbiddenExportedAPI` (source scan for `TRUTH_SCORE` etc.) | §13 G-Audit |
+| REQ-001-06 | `hypothesis/`, `session/` | L, M, N, S | — |
+| REQ-002-01 | tree: no language pkg | `core/object_test::TestRepositoryTreeExact` | §13 G-Scope |
+| REQ-002-02 | no parser imports (non-test) | `core/object_test::TestForbiddenSourceSurface` (bans `go/parser`,`go/scanner`,`go/token` outside `_test.go`) | — |
+| REQ-002-03 | tree exactness | `TestRepositoryTreeExact` | G-Scope |
+| REQ-002-04 | closed node set | `core/expr_test::TestExprKindEnumExact` | — |
+| REQ-002-05 | bounded ops | `ops/negative_test::TestSolveUnsupportedForm`, `TestDifferentiateUnsupportedForms` | — |
+| REQ-002-06 | bounded entailment | `ops/operations_test::TestSignEntailmentBounded` (denied-inference case) | — |
+| REQ-002-07 | no floats | `TestForbiddenSourceSurface` (bans `float64`/`float32` in non-test MVP source) | — |
+| REQ-002-08 | no numerics | `TestForbiddenSourceSurface` (bans `math/rand`, `os/exec`, `net/http`) + `TestNoDeferredPackages` | — |
+| REQ-002-09 | no empirical adapters | `core/object_test::TestNoDeferredPackages` | G-Scope |
+| REQ-002-10 | no truth scoring | `hypothesis_test::TestNoForbiddenExportedAPI` (banned identifiers incl. `Score`,`Rank`) | — |
+| REQ-002-11 | no corpus-status inference | `manifest_test::TestCorpusStatusPreserved` + `TestNoForbiddenExportedAPI` (`SetCorpusStatus`) | source audit |
+| REQ-002-12 | no auto promotion | `hypothesis_test::TestNoForbiddenExportedAPI` | — |
+| REQ-002-13 | no MRC bypass API | `TestNoForbiddenExportedAPI` (`Override`,`Bypass`,`Exempt`) + `session_test::TestSessionSurfaceExact` | — |
+| REQ-002-14 | no MRC exception workflow | same as 002-13 | README MRC-fallibility note |
+| REQ-002-15 | no `physvet` pkg | `TestNoDeferredPackages` | G-Scope |
+| REQ-002-16 | no `electromagnetism` | `TestNoDeferredPackages` | G-Scope |
+| REQ-002-17 | no `qm` | `TestNoDeferredPackages` | G-Scope |
+| REQ-002-18 | no `qft` | `TestNoDeferredPackages` | G-Scope |
+| REQ-002-19 | no `statmech` | `TestNoDeferredPackages` | G-Scope |
+| REQ-002-20 | no GR content | `TestNoDeferredPackages` + relativity manifest scope records | G-Scope |
+| REQ-002-21 | no tensor/index machinery | `TestExprKindEnumExact` + `TestNoDeferredPackages` | — |
+| REQ-002-22 | no symbolic integration | `TestNoForbiddenExportedAPI` (`Integrate`) | — |
+| REQ-002-23 | no series expansion | `TestNoForbiddenExportedAPI` (`Series`,`Taylor`) | §14 deferral |
+| REQ-002-24 | no orchestration runtime | `TestNoDeferredPackages` (no `review` pkg) | — |
+| REQ-002-25 | no EBP 2.1 | `TestNoForbiddenExportedAPI`/G-Scope | README non-goals |
+| REQ-002-26 | no theory platform | G-Scope (`TestRepositoryTreeExact`) | README |
+| REQ-003-01 | §2 tree | `TestRepositoryTreeExact` (exact 39-file set under MVP dirs) | G-Scope |
+| REQ-003-02 | test placement | `TestRepositoryTreeExact` (all tests adjacent `*_test.go`) | — |
+| REQ-003-03 | `package core_test` authority tests | `core/object_test.go` (runs as external package) | compiler enforces package clause |
+
+### 12.2 Dependency graph (§4)
+
+| Requirement ID | Implementation location | Primary test | Secondary |
+|---|---|---|---|
+| REQ-004-01 | package graph | `go test ./...` (compile) | `go list ./...` edge audit |
+| REQ-004-02 | `core` imports | `core/object_test::TestCoreImportIndependence` (parses `core/*.go` imports; forbids `ops`,`session`) | G-Imports |
+| REQ-004-03 | `internal/kernel` | `core/object_test::TestInternalKernelBoundary` (path contains `/internal/`; `core` export surface lacks `MintObject`) | Go toolchain enforces `internal/` rule |
+| REQ-§4-MUST-01 (`core` MUST NOT import `ops`) | `core` imports | `core/object_test::TestCoreImportIndependence` | G-Imports |
+| REQ-§4-MUST-02 (`core` MUST NOT import `session`) | `core` imports | `TestCoreImportIndependence` | G-Imports |
+| REQ-§4-MUST-03 (`ops` MUST NOT import `session`) | `ops` imports | `session/session_test::TestOpsImportsNoSession` (parses `ops/*.go`) | G-Imports |
+
+### 12.3 Object model, kinds, dimensions (§5–§7)
+
+| Requirement ID | Implementation location | Primary test | Secondary |
+|---|---|---|---|
+| REQ-005-01 | domain wrappers | A (`TestTypedMechanicsConstructors`) + relativity ctor test H | compile-time signature check |
+| REQ-005-02 | `ops` signatures | `ops/operations_test` (all 12 via `core.Object`) | G-Imports |
+| REQ-005-03 | thin wrappers | A | G-Audit: domain export surface = constructors+accessors only |
+| REQ-005-04 / REQ-005-10 | `core` surface | `core/object_test::TestNoGenericFactory` (AST: no `NewObject`, no `MintObject` in `core`) | — |
+| REQ-005-05 | domain ctor surfaces | `TestNoGenericFactory` extended to domain packages (AST: no exported fn taking `Kind`/`CorpusStatus` params) | — |
+| REQ-005-06 | unexported fields | `core/object_test::TestKernelObjectFieldsUnexported` (reflect) | — |
+| REQ-005-07 | zero invalid | `TestZeroObjectInvalid` | — |
+| REQ-005-08 | no mutators | `TestObjectAccessorSurfaceExact` (AST method scan: only listed accessors, value receivers) | — |
+| REQ-005-09 | accessor names/types | `TestObjectAccessorSurfaceExact` | A |
+| REQ-§5.3-MUST-01 (returned metadata immutable from caller) | accessors return copies | `TestObjectDefensiveCopies` (mutate returned slice/`Rat`; object unchanged) | — |
+| REQ-005-11 | mint validation | `TestMintObjectRejectsInvalidSpec` (bad expr, empty required name, bad dimension, bad provenance) | — |
+| REQ-005-12 + REQ-§5.5-MUST-01 | ops validity check first | `ops/negative_test::TestInvalidObjectRejected` (loops all 12 `Apply` IDs + `Identify`) | — |
+| REQ-§5.2.1-MUST-01 (exactly one production minting entry point) | `internal/kernel/mint.go` | `TestNoGenericFactory` (AST: single `func MintObject` in module) | source audit |
+| REQ-§5.2.1-MUST-02 (`MintObject` 7-point contract: validity, name, kind, dimension, assumptions, conventions, provenance) | `internal/kernel/mint.go` | `TestMintObjectRejectsInvalidSpec` (one failing case per contract point) | — |
+| REQ-§5.2.1-MUST-03 (MintObject exists only under `internal/kernel`, not re-exported from `core`) | `core` export surface | `TestNoGenericFactory` (AST export list) | G-Imports |
+| REQ-§5.4-MUST-01 (core must not forward mint) | `core/object.go` | `TestNoGenericFactory` | AST export list |
+| REQ-006-01 | 18 Kind values | `core/object_test::TestKindEnumExact` (ordinal + string table) | — |
+| REQ-006-02 | ctor-assigned immutable | `TestObjectAccessorSurfaceExact` + A | — |
+| REQ-006-03 (compatibility table implemented exactly) | `ops/arithmetic.go`, `ops/relation.go` | `ops/operations_test::TestKindCompatibilityTable` (table-driven over full §6.2 grid) | D |
+| REQ-§6.2-MUST-01 (inequality operands must be ordered scalars under the bounded list: Mass, RestMass, Time, Energy, KineticEnergy, SpeedOfLight, Expression) | `ops/relation.go` | `TestInequalityOrderedKinds` (Velocity rejected; each listed kind accepted) | G |
+| REQ-§6.2-MUST-02 (SelectBranch input kind `BranchSet`, constraint kind `Relation`) | `ops/relation.go` | `TestKindCompatibilityTable` (SelectBranch rows) | I |
+| REQ-§6-MUST-01 (ordinals stable in `mrc-v0.4`) | `kernel/types.go` | `TestKindEnumExact` (hardcoded ordinal table) | — |
+| REQ-§7.0-MUST-01 (fixed constructors for all MVP dimensions) | `core/dimension.go` | `core/expr_test::TestDimensionConstructorsAndAPI` (each §7.2 exponent vector) | compile |
+| REQ-§7.0-MUST-02 (`Dimension` exposes the exact read-only API) | `core/dimension.go` | `TestDimensionConstructorsAndAPI` (AST method list) | — |
+| REQ-007-01 + REQ-§7.1-MUST-01 (big.Rat exponents) | `kernel/types.go` | `TestRationalExactSerialization` (`"1/2"`, `-3/4`, `"0/1"`) | `TestForbiddenSourceSurface` (no float) |
+| REQ-007-02 | structural equality | `TestDimensionEqual` | — |
+| REQ-007-03 + REQ-§7.3-MUST-01/02 (deterministic ops; canonical reduced) | `kernel` dimension ops | `TestDimensionArithmetic` (Multiply/Divide/Pow incl. fractional `Pow`), `TestDimensionDeterminism` (double-run bytes) | — |
+| REQ-§7.2 (required dimensions table — normative "MUST" content of §7.2) | `core/dimension.go` constructors | `TestDimensionConstructorsAndAPI` (each constructor vs §7.2 exponents) | — |
+
+### 12.4 Expressions, canonicalization, hashing (§8–§10)
+
+| Requirement ID | Implementation location | Primary test | Secondary |
+|---|---|---|---|
+| REQ-008-01 | closed node set | `core/expr_test::TestExprKindEnumExact` (exactly 10 constants/ordinals) | — |
+| REQ-008-02 | no callbacks in expr | `TestExprStoresNoCallbacks` (reflect field-type scan of `kernel.Expr`) | — |
+| REQ-008-03 | symbols are data | `TestSymbolIsDataOnly` (symbol named `";x=1+1"` round-trips unchanged; no evaluation) | `TestForbiddenSourceSurface` |
+| REQ-008-04 + REQ-§8.4-MUST-01 | exact rational serialization | `TestExactRationalRoundTrip` (P) | — |
+| REQ-008-05 + REQ-§8.5-MUST-01 (no map order; canonicalization list) | structural canonicalization | `TestCanonicalOrderingStable` (REQ-032-17: same tree built in different orders → identical bytes) + `TestConstructorCanonicalization` (flatten/combine/sign/sort) | — |
+| REQ-008-06 | `Pow` exact exponent | `TestPowExponentExact` (type is `*big.Rat`; `"2/1"` bytes) | `TestForbiddenSourceSurface` |
+| REQ-§8.0-MUST-01 (public `core` exposes the fixed expr constructors/helpers) | `core/expr.go` | `core/expr_test::TestExprConstructorSurface` | compile |
+| REQ-§8.0-MUST-02 (read-only inspection methods exist on `Expr`) | `core/expr.go` | `TestExprAccessors` | — |
+| REQ-§8.0-MUST-03 (kind-check before accessors) | `ops` discipline | shared precondition + `negative_test` unsupported-form tests (REQ-032-18..20) | source audit |
+| REQ-§8.0-MUST-04 (defensive copies: `RationalValue`, `Exponent`, slices) | `kernel` accessors | `TestExprDefensiveCopies` (mutate returned slice/`Rat`; tree unchanged) | — |
+| REQ-§8.2-MUST-01 (stable node ordinals) | `kernel` | `TestExprKindEnumExact` (ordinal table) | — |
+| REQ-§8.2.1-MUST-01 (`ExprKind` stable values exactly as listed) | `kernel` | `TestExprKindEnumExact` (name+ordinal table) | — |
+| REQ-§8.2.1-MUST-02 (`RelationOperator` exactly `eq,neq,lt,lte,gt,gte`) | `kernel` | `TestRelationOperatorEnumExact` (canonical strings exactly `eq..gte`) | — |
+| REQ-§8.6-MUST-01 (`Neg(Neg(x))→x`) | constructor canonicalization | `TestConstructorCanonicalization` | — |
+| REQ-§8.8-MUST-01 (no sign rewrite without entailment) | `ops/simplify.go` | `ops/operations_test::TestSqrtSignRewriteRequiresAssumption` | — |
+| REQ-009-01 + REQ-§9.1-MUST-01/02 (`EqualExpr` structural, never display strings; `EqualObject` canonical incl. metadata) | `core/canonical.go` | `core/expr_test::TestEqualExprStructural`, `core/object_test::TestEqualObjectMetadata` | — |
+| REQ-009-02 | `core/canonical.go` (`EqualObject` byte-equality of object canonical JSON) | `TestEqualObjectMetadata` (metadata-only difference ⇒ unequal) | — |
+| REQ-009-03 + REQ-§9.2-MUST-01 (deterministic hashes; lowercase hex in canonical JSON hash fields) | `kernel` hash helper | `TestHashDeterministic` (fixed vectors, double-run bytes) | §31 determinism test (R) |
+| REQ-009-04 + REQ-§9.3-MUST-01 (three-key child order; `bytes.Compare` byte ordering) | `kernel` child sorter | `TestCanonicalOrderingStable` (REQ-032-17) | — |
+| REQ-009-05 (exact rational combination, §9.4) | `kernel` rational arithmetic | `TestExactRationalRoundTrip` (P) + `TestRationalCombinationExact` | — |
+| REQ-§9.6-MUST-01 (exact mechanical identity/zero/rational-`Pow` rule list) | `ops/simplify.go` | `ops/operations_test::TestSimplifyIdentityRules` (each §9.6 rule incl. `0^0` error) | — |
+| REQ-§9.7-MUST-01 (combinations required by MVP derivations: `x·x`, `Pow(x,2)·Pow(x,2)`, `Pow(Pow(x,a),b)` nonneg-int only) | `ops/simplify.go` | `TestSimplifyRepeatedPowers` | — |
+| REQ-§9.7-MUST-02 (no general branch-sensitive power algebra) | `ops/simplify.go` | `ops/negative_test::TestUnsupportedPowerAlgebra` | source audit (no CAS) |
+| REQ-§9.8-MUST-01 (§9.8 `Sqrt` rewrite list) | `ops/simplify.go` | `TestSqrtRewriteRules` (`Sqrt(0)`, `Sqrt(1)`, `Sqrt(Pow(x,2))` gated case) | — |
+| REQ-009-06 (bounded structural entailment only) | `ops/simplify.go` entailment helper | `ops/operations_test::TestSignEntailmentBounded` (denied-inference case) | — |
+| REQ-§9.9-MUST-01 (`Simplify` MUST NOT mint `IDENTIFIED` from `Relation(eq,…)`) | `ops/simplify.go` | K: `ops/negative_test::TestSimplifyNeverIdentifies` | — |
+| REQ-010-01 (typed structs) | all canonical encoders | `TestCanonicalStructsTyped` (reflect: no `map[string]any` fields) | G-Audit |
+| REQ-010-02 (no `map[string]any`) | all canonical encoders | `TestCanonicalStructsTyped` | G-Audit (source scan) |
+| REQ-010-03 (fixed field order = struct declaration order) | encoders in `kernel`/`core` | `TestExactRationalRoundTrip`, `TestObjectCanonicalRoundTrip`, O | — |
+| REQ-010-04 (no JSON numbers for rationals/exponents) | rational/dimension encoders | P, `TestRationalStringNotNumber` (JSON token type `string`) | — |
+| REQ-010-05 (canonical rational strings `"1/2"`) | rational encoder | P (`"1/2"`, `-3/4`, `"0/1"`) | — |
+| REQ-010-06 (no timestamps/random IDs/pointers/env/map order) | all encoders | `TestNoVolatileFields` (source scan: `time.Now`, `rand`, `%p`) | G-Audit |
+| REQ-010-07 (canonical round-trip tests for expr + representative objects) | `core/expr_test.go`, `session/session_test.go` | P + `TestObjectCanonicalRoundTrip` | §13 gate |
+| REQ-§10.3-MUST-01 (dimension JSON field order) | `kernel` dimension encoder | `TestDimensionJSONFieldOrder` (literal field sequence) | — |
+| REQ-§10.4-MUST-01 (object JSON field order) | `kernel` object encoder | `TestObjectCanonicalRoundTrip` (literal field sequence) | — |
+| REQ-§10.5-MUST-01 (byte-identical canonical form + identical hash on round-trip) | expr/object encode-decode | P + `TestObjectCanonicalRoundTrip` + `TestHashDeterministic` | — |
+
+### 12.5 Assumptions, conventions, provenance (§11–§13)
+
+| Requirement ID | Implementation location | Primary test | Secondary |
+|---|---|---|---|
+| REQ-§11.0-MUST-01 (`AssumptionSet` immutable, exact exposed surface) | `core/assumption.go` | `TestAssumptionSetSurface` | — |
+| REQ-§11.0-MUST-02 (`Assumption` read-only `Kind`/`Key`/typed-Value accessors) | `kernel` metadata | `TestAssumptionAccessors` | — |
+| REQ-§11.0-MUST-03 (`Values()` returns a copy) | `core/assumption.go` | `TestAssumptionValuesCopy` (mutate result; set unchanged) | — |
+| REQ-§11.2-MUST-01 (no free-form string relationship encoding) | `Assumption` value union | `TestAssumptionStructuredValue` (E fixtures use `ExprValue`) | G-Audit |
+| REQ-011-01 (structured expression values, never equation strings) | `core/assumption.go` | E + `TestAssumptionStructuredValue` | — |
+| REQ-§11.3-MUST-01 (deterministic constructors per §11.3) | `core/assumption.go` | `TestAssumptionConstructorsDeterministic` (double-run bytes) | — |
+| REQ-§11.3-MUST-02 (keys non-empty) | constructors | `TestAssumptionKeyNonEmpty` (empty key ⇒ error) | — |
+| REQ-§11.4-MUST-01 (same `(Kind,Key)` different canonical value ⇒ conflict) | merge in `core/assumption.go` | E: `ops/negative_test::TestAssumptionConflict` | — |
+| REQ-011-02 (deterministic set union + exact conflict detection) | merge used by all `ops` | E + `TestAssumptionMergeUnion` (order-independence) | — |
+| REQ-§11.6-MUST-01 (`RestMass()` carries `m >= 0`) | `mechanics`/`relativity` primitives | `TestSignAssumptionsCarried` (I/J assumptions check) | — |
+| REQ-§11.6-MUST-02 (`SpeedOfLight()` carries `c > 0`) | `relativity/primitives.go` | `TestSignAssumptionsCarried` | — |
+| REQ-011-02b (§11.1/§11.2 assumption kinds: `fixed_constant`, `state_relation`, `framework_relation` closed set) | `core/assumption.go` | `TestAssumptionKindEnumExact` | G-Audit |
+| REQ-§12.0-MUST-01 (`ConventionSet` exact surface) | `core/convention.go` | `TestConventionSetSurface` | — |
+| REQ-§12.0-MUST-02 (`Values()` returns a copy) | `core/convention.go` | `TestConventionValuesCopy` | — |
+| REQ-012-01 (conflicts rejected deterministically) | merge used by all `ops` | F: `ops/negative_test::TestConventionConflict` | — |
+| REQ-012-02 (no equation solely as convention string) | `Convention{Key,Value string}` type | `TestConventionStringsOnly` + G-Audit | — |
+| REQ-§13.0-MUST-01 (`Provenance` read-only accessors) | `kernel` provenance | `TestProvenanceAccessors` | — |
+| REQ-§13.0-MUST-02 (`ParentHashes()` returns a copy) | `kernel` provenance | `TestProvenanceParentHashesCopy` | — |
+| REQ-§13.0.1-MUST-01 (read-only status values + one deterministic provenance constructor) | `core/provenance.go` | `TestProvenanceConstructorSingle` (AST: exactly one constructor) | G-Audit |
+| REQ-013-01 (`APPROXIMATED` in enum, never minted by MVP op) | `kernel` status enum | `TestProvenanceStatusEnumExact` + ops result-status sweep never yields `APPROXIMATED` | §39 coverage note |
+| REQ-013-02 (exact deterministic status law) | `ops` provenance helper + `session` actions | `TestProvenanceStatusLaw` (table over all 12 ops × statuses; Identify; Postulate/Define/Declare) | K, L, S |
+| REQ-013-03 (parents = canonical object hashes) | `ops`/`session` result build | `TestProvenanceParentHashes` (parents equal input `HashObject`s) | — |
+| REQ-§13.4-MUST-01 (implementing agent MUST NOT infer/revise corpus status) | no corpus-status API | `TestCorpusStatusPreserved` + `TestNoForbiddenExportedAPI` (`SetCorpusStatus`) | G-Audit |
+| REQ-013-04 (library never computes corpus status) | manifest load path | O: `TestCorpusStatusPreserved` | — |
+| REQ-013-05 (no `PHYSICALLY_TRUE`/`TRUTH_SCORE`/`PROBABILITY_OF_TRUTH`/`BEST_THEORY` API) | whole tree | `hypothesis_test::TestNoForbiddenExportedAPI` (banned identifiers incl. `ScoreTruth`) | G-Audit |
+| REQ-§13.5 (source/framework inheritance: preserve iff all inputs identical and non-empty, else empty) | `ops` provenance helper | `TestProvenanceInheritance` (mixed inputs ⇒ empty) | — |
+
+### 12.6 MRC rules and operation contracts (§14–§15)
+
+| Requirement ID | Implementation location | Primary test | Secondary |
+|---|---|---|---|
+| MRC-001 (+ REQ-§14-MUST-01: valid object originates only via §5.4 paths) | `internal/kernel/mint.go`, `core/object.go`, domain/hypothesis constructors | `TestNoGenericFactory`, `TestMintObjectRejectsInvalidSpec`, `TestZeroObjectInvalid`, `TestInternalKernelBoundary` | G-Audit (single `MintObject`) |
+| MRC-002 | `ops` precondition pipeline | C: `ops/negative_test::TestDimensionMismatch` | — |
+| MRC-003 | `ops` kind table (§6.2) | D: `TestKindMismatchEqualDimensions` + `TestKindCompatibilityTable` | G |
+| MRC-004 | `core/assumption.go` merge | E: `TestAssumptionConflict` | — |
+| MRC-005 | `core/convention.go` merge | F: `TestConventionConflict` | — |
+| MRC-006 | `session/session.go::Identify` only | K: `TestSessionIdentifyRecords`, `TestIdentifyRequiresJustification` (REQ-032-08) | G-Audit (no `ops.Identify`) |
+| MRC-007 (+ REQ-§14.7-MUST-01: all committed steps pass through Session) | `session` ledger authority | `TestLedgerConstructionViaSessionOnly`, Q, S | G-Audit |
+| MRC-008 (+ REQ-§14.8-MUST-01/02: hypothesis-dependent result is `HYPOTHESIS`; artifact presenting it trusted ⇒ validation failure) | `ops` status law + `session` candidate validation | L: `TestHypothesisContamination`, `TestCandidateArtifactContainmentRejected` | S |
+| REQ-015-01 (no global/ambient session state) | all `ops` functions | R: `TestDerivationDeterminism` (fresh-Session variant) | G-Audit (no package-level mutable state in `ops`) |
+| REQ-§15-MUST-01 (common semantics: no mutation, validity first, MRC, merge, fresh result, provenance, canonical) | shared `ops` precondition helper | `TestOperationCommonSemantics` (inputs byte-unchanged after every op) | — |
+| REQ-§15.5-MUST-01 (`Pow` clones/reads exponent; no retained caller pointer) | `ops/arithmetic.go` | `TestPowClonesExponent` (mutate caller `*big.Rat`; result unchanged) | — |
+| REQ-§15.6-MUST-01 (`Simplify` MUST NOT: create `IDENTIFIED`, create identification relation, change corpus status, invoke `Session.Identify`, consult session state) | `ops/simplify.go` | K: `TestSimplifyNeverIdentifies` + `TestCorpusStatusPreserved` | G-Audit |
+| REQ-§15.7-MUST-01 (`variable.Expr()` is a single `Symbol` node) | `ops/transform.go` | `TestSubstituteContract` (non-symbol variable ⇒ error) | — |
+| REQ-§15.7-MUST-02 (replacement dimension must equal variable dimension) | `ops/transform.go` | `TestSubstituteDimensionMismatch` | — |
+| REQ-§15.7-MUST-03 (variable and replacement kind must be identical) | `ops/transform.go` | `TestSubstituteContract` (kind mismatch ⇒ error) | — |
+| REQ-§15.7-MUST-04 (all occurrences of the exact variable symbol replaced) | `ops/transform.go` | `TestSubstituteContract` (repeated symbol fully replaced) | G |
+| REQ-§15.8-MUST-01 (`wrt.Expr()` single `Symbol`) | `ops/transform.go` | `TestDifferentiateRequiresSingleSymbol` | — |
+| REQ-§15.8-MUST-02 (result simplified after differentiation) | `ops/transform.go` | G: `TestDifferentiateKineticEnergy` | — |
+| REQ-§15.9-MUST-01 (`Call(lorentz_factor)` expands §15.9.1 body first) | `ops/transform.go` | J: `TestLorentzFactorLimit` | source audit |
+| REQ-§15.9.1-MUST-01 (exact variable/value forms accepted by `Limit`) | `ops/transform.go` | J + `TestLimitForms` | — |
+| REQ-§15.9.1-MUST-02 (MUST NOT return `1` on function-ID match alone) | `ops/transform.go` | `TestLorentzFactorLimit` (traverses body) | G-Audit: source audit of `ops/transform.go` (no ID shortcut) |
+| REQ-§15.11-MUST-01 (Solve target = single `Symbol` matching squared symbol) | `ops/relation.go` | I step 4 + `ops/negative_test::TestSolveUnsupportedForm` (REQ-032-18) | — |
+| REQ-§15.12-MUST-01 (SelectBranch operation MUST sequence of §15.12) | `ops/relation.go` | I step 6 + `TestSelectBranchContract` | — |
+| REQ-§15.12-MUST-02 (mass-energy positive branch simplifies `Sqrt(Pow(m·c²,2)) → m·c²`) | `ops/relation.go` | I final assertion | — |
+| REQ-§15.13-MUST-01 (one fixed dispatch mechanism for replay) | `ops/dispatch.go` | `TestApplyDispatchMatchesSessionReplay` (R) | — |
+| REQ-§15.13-MUST-02 (switch closed over exactly the 12 IDs; `identify` excluded; no registry) | `ops/dispatch.go` | `TestDispatchClosed` (unknown ID ⇒ error; `identify` ⇒ rejected) | G-Audit |
+
+### 12.7 Session and derivation ledger (§16)
+
+| Requirement ID | Implementation location | Primary test | Secondary |
+|---|---|---|---|
+| REQ-016-01 (state machine matches lifecycle `New→Drafting→Committed→Concluded→Sealed`) | `session/session.go` | `TestSessionStateMachine` (every legal + illegal transition) | REQ-032-21 |
+| REQ-§16.2-MUST-01 (empty `Commit` ⇒ `LedgerValidationError`, state stays `Drafting`) | `session/session.go` | `TestCommitEmptyDraftFails` | S |
+| REQ-§16.2-MUST-02 (`Seal` without valid `HYPOTHESIS` ⇒ `ProvenanceError`, state stays `Concluded`) | `session/session.go` | `TestSealRequiresHypothesis` | S |
+| REQ-§16.2.1-MUST-01 (`Hypothesis` valid + `HYPOTHESIS`; `Seal` rejects otherwise) | `DraftMetadata` validation | `TestSealRequiresHypothesis` | — |
+| REQ-§16.2.1-MUST-02 (no separate candidate-metadata mutation methods) | `session` public surface | `TestSessionSurfaceExact` (AST method list) | G-Audit |
+| REQ-§16.3-MUST-01 (exact nine action methods + read-only `Validate`/`CanonicalJSON`) | `session/session.go` | `TestSessionSurfaceExact` | — |
+| REQ-§16.4-MUST-01 (`DerivationID` non-empty, caller-supplied, never auto-generated) | `Session.Draft` | `TestDraftDerivationID` (empty ⇒ error; value preserved verbatim) | — |
+| REQ-§16.6-MUST-01 (Step: state→inputs→reject `identify`→`ops.Apply`→canonical record→buffer→result; no caller-supplied output) | `session/session.go` | `TestStepRecordsApplyResult` + `TestStepRejectsIdentifyOperation` | MRC-007 |
+| REQ-§16.7-MUST-01 (Identify ten-step contract incl. trimmed justification, `IDENTIFIED`/`HYPOTHESIS`, justification in provenance, identification step) | `session.Identify` | K: `TestSessionIdentifyRecords`, `TestIdentifyRequiresJustification` | — |
+| REQ-§16.7-MUST-02 (no global active-session state) | `session` | `TestDerivationDeterminism` (fresh instance) | G-Audit |
+| REQ-§16.8-MUST-01 (draft entries fully specified, externally immutable) | draft buffer (unexported) | `TestSessionSurfaceExact` (no draft-accessor mutation path) | — |
+| REQ-§16.9-MUST-01 (Commit: index from 1, `step-000001` IDs, genesis, chain hashes, retained canonicals, immutable ledger) | `session/ledger.go` | `TestCommitLedgerShape` (StepID/genesis/chain assertions) | — |
+| REQ-§16.9-MUST-02 (draft buffer empty after commit) | `session` | `TestCommitClearsDraft` | — |
+| REQ-§16.10-MUST-01 (Conclude object: valid; hash == last step output hash; becomes conclusion) | `Session.Conclude` | `TestConcludeMatchesFinalOutput` (wrong hash ⇒ error) | S |
+| REQ-§16.11-MUST-01 (full validation before sealing) | `Session.Seal` | `TestSealValidatesFirst` (corrupt-then-seal ⇒ error) | Q |
+| REQ-§16.12-MUST-01 (exact 16-field Step order of §16.12) | `session/ledger.go` | `TestStepFieldOrder` (literal JSON key sequence) | — |
+| REQ-§16.13-MUST-01 (each step retains canonical inputs + params + output) | `session/ledger.go` | `TestReplayUsesRetainedCanonicals` | — |
+| REQ-§16.13-MUST-02 (`HashObject(decoded input) == InputHash`) | `Session.Validate` | Q + `TestReplayUsesRetainedCanonicals` | — |
+| REQ-§16.13-MUST-03 (`HashObject(decoded output) == OutputHash`) | `Session.Validate` | Q | — |
+| REQ-§16.14-MUST-01 (`ParamsCanonical` encodes params for deterministic replay) | `session/ledger.go` | `TestParamsCanonicalRoundTrip` | R |
+| REQ-§16.15-MUST-01 (genesis `PreviousStepHash` = 64 lowercase zeros) | `session/ledger.go` | `TestCommitLedgerShape` | — |
+| REQ-§16.16/16.17/16.18 (StepID determinism; `StepEnvelope` hash formula; derivation hash = last step hash) | `session/ledger.go` | `TestStepEnvelopeHashFormula`, `TestDerivationHashEqualsLastStep` | — |
+| REQ-§16.19-MUST-01 (exact 17-step `Validate` order) | `Session.Validate` | `TestValidatePipelineOrder` (fault-injection per step) | Q |
+| REQ-§16.19-MUST-02 (mismatch ⇒ `LedgerValidationError` or wrapped typed error) | `Session.Validate` | Q: `TestLedgerTamperDetection` | REQ-032-11..14 |
+| REQ-§16.20-MUST-01 (changing only `OutputCanonical` ⇒ hash-mismatch detection) | `Ledger.Validate` | Q: `TestLedgerTamperDetection` mutation 1 | REQ-032-12 |
+| REQ-§16.20-MUST-02 (changing `OutputCanonical` + recomputing only `OutputHash` ⇒ current-step hash mismatch) | `Ledger.Validate` | Q: `TestLedgerTamperDetection` mutation 2 | REQ-032-13 |
+| REQ-§16.20-MUST-03 (changing retained output + recomputing all hashes ⇒ replay divergence detection) | `Session.Validate` | Q: `TestLedgerTamperDetection` mutation 3 | REQ-032-14 |
+| REQ-§16.21-MUST-01 (`Ledger` exact value surface) | `session/ledger.go` | `TestLedgerSurfaceExact` (AST) | — |
+| REQ-§16.21-MUST-02 (`Step` unexported storage, read-only accessors for all §16.12 fields) | `session/ledger.go` | `TestStepAccessorsExact` (AST + reflect) | — |
+
+### 12.8 Corpus manifests and domain packages (§17–§19)
+
+| Requirement ID | Implementation location | Primary test | Secondary |
+|---|---|---|---|
+| REQ-§17.0-MUST-01 (typed manifest structures of §17.0) | `core/corpus.go` | `TestManifestStructSurface` (AST field list/order) | — |
+| REQ-§17.0-MUST-02 (`ParseManifest`, `ValidateManifestBytes`, `CanonicalManifestJSON`, `Manifest.Hash`) | `core/corpus.go` | O: `TestMechanicsManifestCrossCheck`, `TestRelativityManifestCrossCheck` | — |
+| REQ-§17.6-MUST-01 (`statement` never parsed as mathematics) | `core/corpus.go` | `TestStatementNotParsed` | G-Audit (no parser imports) |
+| REQ-§17.7-MUST-01 (loading: typed decode, closed node set, field/enum validation, canonical structure) | `core/corpus.go` | O + `TestManifestRejectsInconsistent` (REQ-032-15) | — |
+| REQ-§17.7-MUST-02 (`ValidateManifestBytes` exists in `core/corpus.go`; no constructors, no I/O) | `core/corpus.go` | `TestValidateManifestBytesPure` (source scan: no ctor calls/`os.ReadFile`) | G-Audit |
+| REQ-§17.8-MUST-01 (static test-only `map[string]func() core.Object`) | both `manifest_test.go` | O (map present; no reflection) | G-Audit |
+| REQ-§17.8-MUST-02 (map resolves every `constructor` id) | both `manifest_test.go` | O (unresolved id ⇒ fail) | — |
+| REQ-§17.8-MUST-03 (nine comparison steps) | both `manifest_test.go` | O (six comparisons asserted per item) | — |
+| REQ-§17.9-MUST-01 (manifest files contain explicit corpus status values) | both `manifest.json` | O: `TestCorpusStatusPreserved` (field present per item) | — |
+| REQ-§17.9-MUST-02 (implementation loads values, never derives them) | `core/corpus.go` loader | O (mismatch fixture ⇒ preserved verbatim) | G-Audit |
+| REQ-§17.9-MUST-03 (tests verify loading preserves declared status) | both `manifest_test.go` | O | — |
+| REQ-§18-MUST-01 (nine exact mechanics constructor signatures) | `mechanics/primitives.go` | A: `TestTypedMechanicsConstructors` (compile-time signatures) | — |
+| REQ-§18-MUST-02 (thin nominal wrappers with `CoreObject()`) | `mechanics/primitives.go` | A | G-Audit (wrapper-only exports) |
+| REQ-§18-MUST-03 (exact constructor naming) | `mechanics/primitives.go` | A + O | — |
+| REQ-§18-MUST-04 (three zero-argument relation constructors + parameterized `NewKineticEnergy`) | `mechanics/relations.go` | B: `TestNewtonSecondLawConstruct`, G | — |
+| REQ-§18-MUST-05 (`NewKineticEnergy(m,v)` exact expression) | `mechanics/relations.go` | G (input to derivative) | — |
+| REQ-§18-MUST-06 (manifest records classical scope + limitation/anomaly record) | `mechanics/manifest.json` | O + N machinery | — |
+| REQ-§19-MUST-01 (eight exact relativity constructor signatures + `Velocity`) | `relativity/primitives.go` | H: `TestEnergyMomentumRelation` (signatures) | — |
+| REQ-§19-MUST-02 (thin nominal wrappers) | `relativity/primitives.go` | H | G-Audit |
+| REQ-§19-MUST-03 (fixed relation/function constructors: `LorentzFactor`, `EnergyMomentumRelation`, `MassEnergyRelation`, zeros) | `relativity/relations.go` | H, I, J | — |
+| REQ-§19-MUST-04 (manifest identifies the four framework assumptions) | `relativity/manifest.json` | H (assumptions check) + O | — |
+| REQ-§19-MUST-05 (`EnergyMomentumRelation()` exact form) | `relativity/relations.go` | H (byte fixture) | — |
+| REQ-§19-MUST-06 (carries `m >= 0` and `c > 0` through constituents) | `relativity/relations.go` | H + `TestSignAssumptionsCarried` | — |
+| REQ-§19-MUST-07 (`MassEnergyRelation` manifest provenance `DERIVED` + metadata) | `relativity/manifest.json` | O | — |
+| REQ-§19-MUST-08 (vertical derivation test MUST NOT call `MassEnergyRelation()`) | `relativity/derivation_test.go` | I | G-Audit (source scan of test) |
+| REQ-§19-MUST-09 (zero constructors exposed) | `relativity/relations.go` | I (steps 2, 5) | — |
+| REQ-§19-MUST-10 (manifest contains structured scope limitation/anomaly record) | `relativity/manifest.json` | N: `TestCandidateReferencesManifestAnomaly` | — |
+
+### 12.9 Canonical vertical slices (§20–§25)
+
+| Requirement ID | Implementation location | Primary test | Secondary |
+|---|---|---|---|
+| REQ-§20-MUST-01 (six-step §20 sequence executed with real operations) | slice I test | I: `TestMassEnergyDerivation` (each golden-trace state asserted) | — |
+| REQ-§20-MUST-02 (test MUST NOT call `MassEnergyRelation()`) | slice I test | I | G-Audit (test source scan) |
+| REQ-§21-MUST-01 (derivative nontrivial; exercises Expression-vs-named comparison) | slice G test | G: `TestDifferentiateKineticEnergy` | — |
+| REQ-§21-MUST-02 (comparison accepted under MRC-003) | `ops/relation.go` + G test | G (`Compare(result, Momentum(), eq)` accepted) | D table |
+| REQ-§22-MUST-01 (limit result from fixed-body expansion + substitution + simplify) | slice J test | J: `TestLorentzFactorLimit` | G-Audit |
+| REQ-§23-MUST-01 (firewall test establishes both sides) | slice K tests | K: `TestSimplifyNeverIdentifies` + `TestSessionIdentifyRecords` | — |
+| REQ-§23-MUST-02 (Simplify path: no `IDENTIFIED`, no identification event) | `ops/simplify.go` | K | — |
+| REQ-§23-MUST-03 (Identify path: full recording contract) | `session.Identify` | K | — |
+| REQ-024-01 (candidate construction forces `HYPOTHESIS`) | `hypothesis/candidate.go` | L: `TestHypothesisContamination` | — |
+| REQ-024-02 (explicit `Kind` and `Dimension` required) | `hypothesis.NewCandidateConcept` | `TestCandidateConceptRequiresKindDimension` | — |
+| REQ-§24.3-MUST-01 (containment test: downstream statuses all `HYPOTHESIS`) | slice L test | L (op sweep + Identify) | — |
+| REQ-§24.4-MUST-01 (no promotion-equivalent exported names anywhere) | whole tree | L: `TestNoForbiddenExportedAPI` (banned list) | G-Audit |
+| REQ-§25-MUST-01 (structure without true/false decision) | `session` falsifiability types | M: `TestSealedCandidatePreservesFalsifiability` | G-Audit (no truth fields) |
+| REQ-§25.5-MUST-01 (provisional candidate constructed with ≥1 prediction + ≥1 falsification condition) | slice M test | M | — |
+| REQ-§25.5-MUST-02 (sealed artifact preserves them byte-identically) | `Session.Seal` | M (accessor + `CanonicalJSON` round-trip) | — |
+
+### 12.10 ResearchCandidate and review artifacts (§26–§27)
+
+| Requirement ID | Implementation location | Primary test | Secondary |
+|---|---|---|---|
+| REQ-§26.0-MUST-01 (canonical data types: `FrameworkDependency`, `Prediction`, `FalsificationCondition`, `RecoveryClaim`, `AnomalyReference` in `session`; `Challenge`/`Review` in `core/corpus.go` re-aliased) | `session/research_candidate.go`, `core/corpus.go` | `TestSupportTypeSurface` (AST) | — |
+| REQ-§26.0-MUST-02 (deterministic canonical encoders; no dynamic maps) | support types | `TestSupportTypeCanonicalDeterministic` (double-run) | REQ-010-02 |
+| REQ-§26.3-MUST-01 (`Hypothesis` is candidate concept with `HYPOTHESIS`) | `DraftMetadata` + `Seal` | L, S | — |
+| REQ-§26.3-MUST-02 (artifact never replaces it with trusted status) | candidate validation | `TestCandidateArtifactContainmentRejected` | REQ-032-09 |
+| REQ-§26.6-MUST-01 (derivation final hash == `LedgerHash`) | `Seal` | S: `TestSealResearchCandidate` | — |
+| REQ-§26.8-MUST-01 (seven-stage validation pipeline, exact order) | `ResearchCandidate.Validate` | `TestValidatePipelineOrder` (fault-injection per stage) | S |
+| REQ-§26.8-MUST-02 (`session` MUST NOT import `mechanics`/`relativity`; external anomaly cross-check in tests) | `session` imports | `TestSessionImportIndependence` (AST import scan) | G-Imports |
+| REQ-§26.9-MUST-01 (external JSON never decoded into trusted value; unverified wrapper) | `ParseResearchCandidateJSON` | REQ-032-10a: `TestParseResearchCandidateJSONUnverifiedOnly` | G-Audit |
+| REQ-§26.9-MUST-02 (containment failures ⇒ `CandidateContainmentError`) | candidate validation | L: `TestCandidateArtifactContainmentRejected` | — |
+| REQ-§26.9-MUST-03 (self-recomputed hashes never treated as authenticity) | candidate validation | `TestValidateDoesNotTrustRecomputedHashes` (rewrite all hashes ⇒ still consistency-only) | README audit |
+| REQ-§26.10-MUST-01 (unexported storage; no arbitrary public constructor) | `session` | `TestCandidateSurfaceExact` (AST: no exported struct literal/ctor) | — |
+| REQ-§26.10-MUST-02 (`UnverifiedResearchCandidate.Validate` delegates to same private seal path; no independent path) | `session/research_candidate.go` | `TestUnverifiedValidateDelegatesToSeal` (same errors/behavior as `Seal`) | G-Audit (one private ctor) |
+| REQ-§26.10-MUST-03 (exact 14 accessors + `Validate` + `CanonicalJSON`) | `session` | `TestCandidateSurfaceExact` | — |
+| REQ-§26.10-MUST-04 (collection accessors return copies) | `session` | `TestCandidateAccessorsCopy` | — |
+| REQ-§26.10-MUST-05 (exact unverified surface: type + 3 funcs) | `session` | `TestUnverifiedSurfaceExact` (AST) | — |
+| REQ-§26.10-MUST-06 (`Parse…` returns only `UnverifiedResearchCandidate`; no `core.Object` accessors) | `session` | REQ-032-10a test | G-Audit |
+| REQ-§26.10-MUST-07 (`Unverified…Validate()` only public path; runs full §26.8 pipeline) | `session` | REQ-032-10a + pipeline fault-injection | — |
+| REQ-§27 (Challenge/Review types; eight categories; orchestration boundary §27.4) | `core/corpus.go`, `session` aliases | `TestReviewCategoryEnumExact` (eight names), `TestCandidateReviewHistoryRoundTrip` | G-Audit (no orchestration pkg) |
+
+### 12.11 Manifest data, errors, determinism, negative tests, acceptance (§28, §30–§33)
+
+| Requirement ID | Implementation location | Primary test | Secondary |
+|---|---|---|---|
+| REQ-§28-MUST-01 (mechanics manifest ≥ the 11 required items) | `mechanics/manifest.json` | O (item-ID set assertion) | — |
+| REQ-§28-MUST-02 (relativity manifest ≥ the 10 required items) | `relativity/manifest.json` | O (item-ID set assertion) | — |
+| REQ-§28-MUST-03 (each framework manifest ≥ 1 limitation/anomaly record) | both manifests | O + N | — |
+| REQ-§28-MUST-04 (candidate test references ≥ 1 such record) | slice N test | N: `TestCandidateReferencesManifestAnomaly` | — |
+| REQ-§30-MUST-01 (all 11 typed errors implement `error`) | `core/errors.go` | `TestErrorTypesImplementError` (compile-time + loop) | — |
+| REQ-§30-MUST-02 (all inspectable with `errors.As`) | `core/errors.go` | `TestErrorsAsInspectable` (every negative test uses `errors.As`) | C–F, Q |
+| REQ-§30-MUST-03 (normal MRC violations never panic) | `ops`, `session` | `TestNoPanicOnMRCViolation` (table; any `recover` ⇒ test failure) | — |
+| REQ-§30-MUST-04 (deterministic diagnostic fields; no nondeterministic values) | error construction | `TestErrorDiagnosticsDeterministic` (double-run byte equality) | — |
+| REQ-§31-MUST-01 (two identical runs ⇒ byte-identical canonical artifacts) | whole pipeline | R: `TestDerivationDeterminism` | §13 |
+| REQ-§31-MUST-02 (the 12 listed artifact classes deterministic; no timestamps/UUIDs/pointers/map order/locale/PIDs/hostnames) | all encoders | `TestNoVolatileFields` + R | G-Audit |
+| REQ-§31.1 (same-process double run + fresh-Session run) | slice R test | R: `TestDerivationDeterminism` | — |
+| REQ-§32-MUST-01 (tests exist for all listed failure classes) | `*_test.go` | §13 gate (inventory check) | — |
+| REQ-032-01 dimension mismatch | `ops` | `TestDimensionMismatch` (C) | — |
+| REQ-032-02 kind mismatch, equal dimensions | `ops` | `TestKindMismatchEqualDimensions` (D) | — |
+| REQ-032-03 assumption conflict | `core` merge via `ops` | `TestAssumptionConflict` (E) | — |
+| REQ-032-04 convention conflict | `core` merge via `ops` | `TestConventionConflict` (F) | — |
+| REQ-032-05 invalid zero `core.Object` | `ops`/`session` | `TestInvalidObjectRejected` (all 12 + `Identify`) | — |
+| REQ-032-06 absence of public generic object factory | `core` | `TestNoGenericFactory` (AST) | G-Audit |
+| REQ-032-07 `Simplify` cannot create `IDENTIFIED` | `ops/simplify.go` | `TestSimplifyNeverIdentifies` (K) | — |
+| REQ-032-08 missing Identify justification | `session` | `TestIdentifyRequiresJustification` | — |
+| REQ-032-09 candidate contamination bypass | `session` validation | `TestCandidateArtifactContainmentRejected` (L) | — |
+| REQ-032-10 absence of promotion API | whole tree | `TestNoForbiddenExportedAPI` | G-Audit |
+| REQ-032-10a external candidate JSON loads only as `UnverifiedResearchCandidate`; no public parse returns trusted values | `session` | `TestParseResearchCandidateJSONUnverifiedOnly` | G-Audit |
+| REQ-032-11 corrupted ledger hash chain | `session/ledger.go` | `TestLedgerTamperDetection` case 1 (Q) | — |
+| REQ-032-12 modified intermediate canonical output | `session/ledger.go` | Q case 2 | — |
+| REQ-032-13 modified output, recomputed local hash, stale step hash | `session/ledger.go` | Q case 3 | — |
+| REQ-032-14 recomputed full chain, replay divergence | `session/ledger.go` | Q case 4 | — |
+| REQ-032-15 inconsistent manifest | `core/corpus.go` | `TestManifestRejectsInconsistent` (O) | — |
+| REQ-032-16 exact-rational canonical JSON round-trip | `kernel` encoder | P: `TestExactRationalRoundTrip` | — |
+| REQ-032-17 nondeterministic canonicalization attempt | `kernel` sorter | `TestCanonicalOrderingStable` (different build orders ⇒ same bytes) | — |
+| REQ-032-18 unsupported general solver form | `ops/relation.go` | `TestSolveUnsupportedForm` | — |
+| REQ-032-19 unsupported derivative node/function form | `ops/transform.go` | `TestDifferentiateUnsupportedForms` (`Sqrt`, `Call`, `Relation`, `BranchSet`, non-integer exponent) | — |
+| REQ-032-20 unsupported general limit form | `ops/transform.go` | `TestLimitUnsupportedForm` | — |
+| REQ-032-21 invalid session state transition | `session` | `TestSessionStateMachine` (every illegal transition ⇒ typed error) | — |
+| REQ-032-22 post-seal mutation attempt | `session` | `TestPostSealMutationRejected` (all nine actions after `Sealed`) | — |
+
+**Acceptance A–S (plan9 §33)** — every row maps to a §11 slice test:
+
+| Acceptance | Requirement | Test function | File |
+|---|---|---|---|
+| A typed mechanics | REQ-001-01, REQ-005-01 | `TestTypedMechanicsConstructors` | `mechanics/relations_test.go` |
+| B classical relation | REQ-001-03, §28 | `TestNewtonSecondLawConstruct` + `TestNewtonSecondLawManifestMatch` | `mechanics/*_test.go` |
+| C dimension rejection | MRC-002, REQ-032-01 | `TestDimensionMismatch` | `ops/negative_test.go` |
+| D category rejection | MRC-003, REQ-032-02 | `TestKindMismatchEqualDimensions` | `ops/negative_test.go` |
+| E assumption conflict | MRC-004, REQ-032-03 | `TestAssumptionConflict` | `ops/negative_test.go` |
+| F convention conflict | MRC-005, REQ-032-04 | `TestConventionConflict` | `ops/negative_test.go` |
+| G differentiation | §21 | `TestDifferentiateKineticEnergy` | `mechanics/relations_test.go` |
+| H relativistic relation | REQ-001-02 | `TestEnergyMomentumRelation` | `relativity/derivation_test.go` |
+| I mass-energy derivation | §20 | `TestMassEnergyDerivation` | `relativity/derivation_test.go` |
+| J relativistic limit | §22 | `TestLorentzFactorLimit` | `relativity/derivation_test.go` |
+| K Identify firewall | MRC-006, REQ-013-02 | `TestSimplifyNeverIdentifies` + `TestSessionIdentifyRecords` | `ops/negative_test.go`, `session/session_test.go` |
+| L candidate containment | MRC-008, REQ-024 | `TestHypothesisContamination` + `TestCandidateArtifactContainmentRejected` | `hypothesis/candidate_test.go` |
+| M falsifiability | §25 | `TestSealedCandidatePreservesFalsifiability` | `hypothesis/candidate_test.go` |
+| N anomaly | §28.3 | `TestCandidateReferencesManifestAnomaly` | `hypothesis/candidate_test.go` |
+| O manifest | REQ-001-03 | `TestMechanicsManifestCrossCheck` + `TestRelativityManifestCrossCheck` | both `manifest_test.go` |
+| P exact rational round-trip | REQ-032-16 | `TestExactRationalRoundTrip` | `core/expr_test.go` |
+| Q ledger tamper/replay | REQ-032-11..14 | `TestLedgerTamperDetection` | `session/session_test.go` |
+| R determinism | REQ-015-01, §31 | `TestDerivationDeterminism` | `session/session_test.go` |
+| S candidate handoff | REQ-000-03, §26 | `TestSealResearchCandidate` | `session/session_test.go` |
+
+### 12.12 Evaluation, documentation, deferrals, plan-level requirements (§34–§41 + prompt v2.2)
+
+| Requirement ID | Implementation location | Primary test | Secondary |
+|---|---|---|---|
+| REQ-§34-MUST-01 (each framework evaluated by three complementary mechanisms) | slice tests B/G/I/J/N | O + derivation + reduction tests | §13 gate |
+| REQ-§34.3-MUST-01 (framework manifest contains ≥ 1 limitation/anomaly record) | both manifests | O + N | — |
+| REQ-§35-MUST-01 (translation doc has the three sections) | `docs/paper-translation.md` | `TestDocsSectionsPresent` (docs audit in `core/object_test.go`) | — |
+| REQ-§35-MUST-02 (doc never required for runtime) | docs only | `TestNoDocsImport` (source scan: no package imports docs) | G-Imports |
+| REQ-§36-MUST-01/02 (`physvet` v0.5 contract recorded only; must not redefine the eight semantic contracts) | plan9 §36 + plan §14 | G-Scope (no `physvet` package) | deferral row |
+| REQ-§37 (all 22 v0.5+ deferrals excluded from MVP) | plan §14 (below) | `TestNoDeferredPackages` + `TestRepositoryTreeExact` | G-Scope |
+| REQ-§38-MUST-01 (no files outside §3) | tree | `TestRepositoryTreeExact` (39 files) | §13 G-Scope |
+| REQ-§39-MUST-01 (this matrix maps every MUST/MUST NOT clause to location + test) | plan §12 | §13 completeness check (below) | — |
+| REQ-§39-MUST-02 (grouped rows expanded individually) | plan §12 | §13 completeness check | — |
+| REQ-§40 (the 10 architecture invariants) | plan §1–§11 | §13 gates (import/export audits) | — |
+| REQ-§41-MUST-01 (single architecture; no reopened decisions) | plan §1–§11 | §13 gate (plan review) | — |
+| REQ-§Prompt-MUST-01 (module path exactly `github.com/PithomLabs/phys` everywhere) | `go.mod` + all imports | G-Module + G-Imports | — |
+| REQ-§Prompt-MUST-02 (plan covers all six product requirements) | plan §1, §12.1 | §13 review | — |
+| REQ-§Prompt-MUST-03 (candidate JSON loads only as unverified; only `session` yields trusted; delegation to private path) | `session` | REQ-032-10a test | §12.10 rows |
+| REQ-§Prompt-MUST-04 (`session` MUST NOT import `mechanics`, `relativity`, `hypothesis`) | `session` imports | `TestSessionImportIndependence` | G-Imports |
+| REQ-§Prompt-MUST-05 (adjacent `*_test.go` only; no convenience files) | tree | `TestRepositoryTreeExact` | G-Scope |
+| REQ-§Prompt-MUST-06 (ordered 16-step sequence, each step with the five parts, starting from kernel) | plan §3 | §13 review | — |
+| REQ-§Prompt-MUST-07 (`statement` never parsed) | `core/corpus.go` | `TestStatementNotParsed` | G-Audit |
+| REQ-§Prompt-MUST-08 (this plan maps every MUST clause + every MRC ID) | plan §12 | §13 completeness check | — |
+| REQ-§Prompt-MUST-09 (plan proposes one architecture; no "coding agent can decide") | plan §1–§11 | §13 review | — |
+| REQ-§Prompt-MUST-10 (plan has type signatures/field lists/algorithms, no implementation bodies) | plan | §13 review | — |
+| REQ-§Prompt-MUST-11 (`ParseResearchCandidateJSON` returns only `UnverifiedResearchCandidate`) | `session` | REQ-032-10a test | — |
+| REQ-§Prompt-MUST-12 (prompt-level approval/handoff discipline: write plan file, stop, wait for user review) | workflow | §13 review | — |
+
+---
+
+## 13. Acceptance gate
+
+The MVP is accepted only when every condition below passes from the repository root, with zero warnings and zero skipped tests.
+
+**Exact commands (run in order):**
+
+```text
+go build ./...
+go vet ./...
+go test ./...
+```
+
+**Gate checklist:**
+
+1. **G-Module** — `go.mod` contains exactly `module github.com/PithomLabs/phys`, `go 1.24`, and an empty `require` block (no `go.sum` needed); every internal import resolves under `github.com/PithomLabs/phys/...` (REQ-000-01, REQ-000-02, REQ-§0.1-MUST-01/02).
+2. **G-Imports** — `go list -deps ./...` contains only standard-library packages (zero third-party modules); AST import audit asserts: `core` imports neither `ops` nor `session` (REQ-§4-MUST-01/02); `ops` imports neither `session` nor domain packages (REQ-004-01); `session` imports neither `mechanics`/`relativity`/`hypothesis` (prompt §13); no non-test file imports `go/parser`, `go/scanner`, `go/token`, `math/rand`, `net/http`, or `os/exec`; `kernel` is `internal/` (REQ-004-03).
+3. **G-Scope** — exact file-tree audit: exactly the 39 files of plan §2 (24 Go source, 10 `*_test.go`, 2 `manifest.json`, 3 config/doc), no file outside the §2 list (REQ-003-01, REQ-§38-MUST-01), no deferred package (`physvet`, `electromagnetism`, `qm`, `qft`, `statmech`, `review`), no scaffold/generated/convenience files (prompt §13); tests are adjacent `*_test.go` only (REQ-003-02), with external test packages wherever package visibility is the subject (REQ-003-03).
+4. **G-Audit** — source/AST audits: no `float32`/`float64`/`math.` in non-test sources (REQ-007-01 secondary); no `map[string]any` in canonical encoders (REQ-010-02); exactly one `func MintObject` in the module, under `internal/kernel`, not re-exported (REQ-005-04, REQ-§5.2.1, REQ-§5.4-MUST-01); no exported `NewObject` in public packages; no promotion/bypass/truth API names (`Promote`, `Trust`, `ApproveHypothesis`, `PromoteToEstablished`, `SetCorpusStatus`, `ApproveException`, `OverrideMRC`, `BypassMRC`, `Integrate`, `Series`, `Taylor`, `Simulate`, `RankTheories`, `ScoreTruth`, `TruthScore`, `ProbabilityOfTruth`, `BestTheory`) (REQ-013-05, REQ-§24.4-MUST-01); `ops/transform.go` expands the fixed Lorentz body rather than matching a function ID (REQ-§15.9.1-MUST-02); `Simplify` never creates `IDENTIFIED` (REQ-§15.6-MUST-01); no package-level mutable state in `ops`/`session` (REQ-015-01, REQ-§16.7-MUST-02); `statement` never parsed (REQ-§17.6-MUST-01); no `ops.Identify` export (MRC-006).
+5. **Acceptance A–S** — every function named in §12.11's acceptance table exists with the exact name and package, and passes under `go test ./...` (19 rows, 21 test functions; plan9 §33).
+6. **Negative suite** — all 23 REQ-032 rows (01–22 plus 10a) present and passing (plan9 §32), including all four ledger tamper cases (REQ-032-11..14).
+7. **Determinism** — `TestDerivationDeterminism` runs the canonical derivation twice in-process and once with a fresh `Session`; canonical artifacts, hashes, ledger JSON, and candidate JSON are byte-identical (REQ-§31-MUST-01/02, REQ-§31.1).
+8. **Coverage completeness** — every MUST/MUST NOT clause in plan9 §0–§41 and every MRC-001..008 ID appears in plan §12 with an implementation location and ≥1 named test; grouped REQ ranges are expanded to individual rows (REQ-§39-MUST-01/02, prompt §13).
+9. **Documentation** — README contains module identity, dependency diagram, constructor-authority statement (external/public API boundary, not cryptographic — REQ-000-04), MRC list with `mrc-v0.4` fallibility note (REQ-000-03), integrity-vs-authenticity statement, and non-goals/deferrals; `docs/paper-translation.md` contains the three §35 sections (REQ-§35-MUST-01).
+10. **Plan conformance** — implementation invents no architecture beyond plan §1–§11, adds no file outside plan §2, uses stdlib only, and leaves no normative requirement without a test mapping (REQ-§41-MUST-01, prompt §13).
+
+A build that requires reopening any plan9 §41 decision is non-conforming.
+
+---
+
+## 14. Explicit deferrals
+
+All of the following are v0.5+ and excluded from MVP (plan9 §37, repeated exactly):
+
+1. `physvet` implementation.
+2. General symbolic series expansion.
+3. General truncation-order propagation.
+4. Full 1905 Einstein low-velocity series derivation.
+5. Symbolic integration.
+6. Broader symbolic calculus.
+7. General equation solving.
+8. General power/branch algebra.
+9. Richer tensor/index machinery.
+10. General relativity.
+11. Quantum mechanics.
+12. Quantum field theory.
+13. Statistical mechanics.
+14. Electromagnetism.
+15. Numerical execution.
+16. Empirical-data adapters.
+17. Reviewer-AI orchestration.
+18. Automatic corpus governance.
+19. Automatic hypothesis promotion.
+20. MRC exception/override workflow.
+21. EBP 2.1 integration.
+22. General theory-management platform.
+
+No deferred feature may leak into MVP through placeholder packages or speculative abstractions (REQ-§37; enforced by `TestNoDeferredPackages` + `TestRepositoryTreeExact`). The prompt's deferral list (general series expansion, full 1905 Einstein derivation, broader symbolic analysis, integration, richer tensor/index machinery, GR/QM/QFT/stat-mech/EM, numerical execution, empirical adapters, reviewer orchestration, MRC exception workflow, automatic corpus governance, automatic hypothesis promotion, EBP 2.1, physvet) is a subset of this 22-item list — no additions to scope.
+
+---
+
+## 15. Scope accounting
+
+**File count:** exactly **39** files including `go.mod` (38 excluding it), against the ≤40 budget of plan9 §38 (REQ-§38-MUST-01).
+
+**Exact split:**
+
+| Class | Count | Files |
+|---|---|---|
+| Go source | 24 | `internal/kernel/{types,mint}.go` (2); `core/{object,expr,dimension,assumption,convention,provenance,corpus,canonical,errors}.go` (9); `ops/{arithmetic,simplify,transform,relation,dispatch}.go` (5); `session/{session,ledger,research_candidate}.go` (3); `mechanics/{primitives,relations}.go` (2); `relativity/{primitives,relations}.go` (2); `hypothesis/candidate.go` (1) |
+| Go test | 10 | `core/{object,expr}_test.go` (2); `ops/{operations,negative}_test.go` (2); `session/session_test.go` (1); `mechanics/{manifest,relations}_test.go` (2); `relativity/{manifest,derivation}_test.go` (2); `hypothesis/candidate_test.go` (1) |
+| JSON manifest | 2 | `mechanics/manifest.json`, `relativity/manifest.json` |
+| Config/documentation | 3 | `go.mod`, `README.md`, `docs/paper-translation.md` |
+
+**Major exported types:** `core.Object` (= `kernel.Object`), `core.Expr`, `core.Kind` (18 constants), `core.Dimension` (+9 constructors), `core.Assumption`/`AssumptionSet`, `core.Convention`/`ConventionSet`, `core.Provenance`, `core.CorpusStatus`, `core.Manifest` (+ `ManifestDomain/Limit/Anomaly/Reduction/Item`), `core.Challenge`, `core.Review`, the 11 typed errors (`DimensionMismatchError` … `LedgerValidationError`), `ops.OperationID`, `ops.OperationParams`, `session.Session`, `session.Ledger`, `session.Step` (read-only accessors), `session.DraftMetadata`, `session.ResearchCandidate`, `session.UnverifiedResearchCandidate`, `session.FrameworkDependency`, `session.Prediction`, `session.FalsificationCondition`, `session.RecoveryClaim`, `session.AnomalyReference`, `hypothesis.NewCandidateConcept` (returns a `core.Object`).
+
+**Major operations:** 12 pure operations (`Add`, `Subtract`, `Multiply`, `Divide`, `Pow`, `Simplify`, `Substitute`, `Differentiate`, `Limit`, `Compare`, `Solve`, `SelectBranch`) behind the closed `ops.Apply` dispatch; 9 session actions (`Postulate`, `Declare`, `Define`, `Step`, `Identify`, `Draft`, `Commit`, `Conclude`, `Seal`) plus read-only `Validate`/`CanonicalJSON`; manifest API (`ParseManifest`, `ValidateManifestBytes`, `CanonicalManifestJSON`, `Manifest.Hash`); candidate API (`Seal`, `Validate`, `CanonicalJSON`, `ParseResearchCandidateJSON`); 9 mechanics + 8 relativity value constructors and the relation constructors of §18.4/§19.3; `kernel.MintObject` (the single internal mint point).
+
+**Expected dependency count:** **0** third-party Go modules — the `require` block in `go.mod` is empty (REQ-000-02; prompt §1). Intra-repo compile-time package edges (12 total, verified by G-Imports): `internal/kernel` → ∅; `core` → `internal/kernel`; `ops` → `core`, `internal/kernel`; `session` → `core`, `ops`, `internal/kernel`; `mechanics` → `core`, `internal/kernel`; `relativity` → `core`, `internal/kernel`; `hypothesis` → `core`, `internal/kernel`. Test-only edges from `*_test.go` into `ops`/`session`/domain packages are allowed and additional (REQ-003-02/03).
+
+---
+
+Open Spec Items: NONE
