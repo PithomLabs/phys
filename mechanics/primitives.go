@@ -19,7 +19,7 @@ type Mass struct {
 
 func NewMass() Mass {
 	sym, _ := kernel.NewSymbol("m")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Newton, Principia", "classical_mechanics",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Classical Mechanics corpus", "classical_mechanics",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "m",
@@ -41,7 +41,7 @@ type Time struct {
 
 func NewTime() Time {
 	sym, _ := kernel.NewSymbol("t")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Newton, Principia", "classical_mechanics",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Classical Mechanics corpus", "classical_mechanics",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "t",
@@ -63,7 +63,7 @@ type Position struct {
 
 func NewPosition() Position {
 	sym, _ := kernel.NewSymbol("x")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Newton, Principia", "classical_mechanics",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Classical Mechanics corpus", "classical_mechanics",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "x",
@@ -85,7 +85,7 @@ type Velocity struct {
 
 func NewVelocity() Velocity {
 	sym, _ := kernel.NewSymbol("v")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Newton, Principia", "classical_mechanics",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Classical Mechanics corpus", "classical_mechanics",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "v",
@@ -107,7 +107,7 @@ type Acceleration struct {
 
 func NewAcceleration() Acceleration {
 	sym, _ := kernel.NewSymbol("a")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Newton, Principia", "classical_mechanics",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Classical Mechanics corpus", "classical_mechanics",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "a",
@@ -129,7 +129,7 @@ type Force struct {
 
 func NewForce() Force {
 	sym, _ := kernel.NewSymbol("F")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Newton, Principia", "classical_mechanics",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Classical Mechanics corpus", "classical_mechanics",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "F",
@@ -151,7 +151,7 @@ type Momentum struct {
 
 func NewMomentum() Momentum {
 	sym, _ := kernel.NewSymbol("p")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Newton, Principia", "classical_mechanics",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Classical Mechanics corpus", "classical_mechanics",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "p",
@@ -173,7 +173,7 @@ type Energy struct {
 
 func NewEnergy() Energy {
 	sym, _ := kernel.NewSymbol("E")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Newton, Principia", "classical_mechanics",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Classical Mechanics corpus", "classical_mechanics",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "E",
@@ -215,13 +215,13 @@ func NewKineticEnergy(m Mass, v Velocity) KineticEnergy {
 	return KineticEnergy{obj}
 }
 
-// CoreObject returns the underlying kernel.Object.
-func (m Mass) CoreObject() kernel.Object       { return m.Object }
-func (t Time) CoreObject() kernel.Object       { return t.Object }
-func (p Position) CoreObject() kernel.Object   { return p.Object }
-func (v Velocity) CoreObject() kernel.Object   { return v.Object }
-func (a Acceleration) CoreObject() kernel.Object { return a.Object }
-func (f Force) CoreObject() kernel.Object      { return f.Object }
-func (m Momentum) CoreObject() kernel.Object   { return m.Object }
-func (e Energy) CoreObject() kernel.Object     { return e.Object }
-func (k KineticEnergy) CoreObject() kernel.Object { return k.Object }
+// CoreObject returns the underlying core.Object.
+func (m Mass) CoreObject() core.Object       { return m.Object }
+func (t Time) CoreObject() core.Object       { return t.Object }
+func (p Position) CoreObject() core.Object   { return p.Object }
+func (v Velocity) CoreObject() core.Object   { return v.Object }
+func (a Acceleration) CoreObject() core.Object { return a.Object }
+func (f Force) CoreObject() core.Object      { return f.Object }
+func (m Momentum) CoreObject() core.Object   { return m.Object }
+func (e Energy) CoreObject() core.Object     { return e.Object }
+func (k KineticEnergy) CoreObject() core.Object { return k.Object }

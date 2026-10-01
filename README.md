@@ -55,3 +55,22 @@ hypothesis             → core + kernel (never mechanics/relativity at build ti
 - MRC-006: identification firewall (`Identify` only via `Session.Identify` — §14.6 / §16.7).
 - MRC-007: session authority (ledger commit / seal — §16 / §26).
 - MRC-008: candidate containment (§26.8 / §26.9 / §26.10).
+
+## Epistemic architecture (H0 — theory isolation)
+
+- `internal/kernel` is theory-neutral formal machinery (dimensions, assumptions,
+  provenance, canonicalization, mint authority) plus only the
+  specification-mandated closed identifiers. It contains no physical theory.
+- `mechanics/` is the bounded classical-mechanics framework corpus;
+  `relativity/` is the bounded special-relativity framework corpus. Each owns
+  its objects, relations, assumptions, conventions, scope, limitations,
+  anomalies, derivations, and corpus metadata. Framework assumptions enter
+  derivations only through explicit trusted objects, never ambiently.
+- An established framework (`ESTABLISHED`) remains explicitly bounded by its
+  assumptions and scope; it does not become an ambient axiom of the kernel.
+- `hypothesis/` is the provisional candidate space (HYPOTHESIS/NONE);
+  hypotheses never auto-promote to established corpus status.
+- The E=mc² MVP demonstration is a formal derivation composed from encoded
+  special-relativity premises through the operation pipeline. It is not a
+  historical reconstruction of Einstein's 1905 argument and not an empirical
+  discovery or truth adjudication.

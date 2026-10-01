@@ -19,7 +19,7 @@ type Spacetime struct {
 
 func NewSpacetime() Spacetime {
 	sym, _ := kernel.NewSymbol("s")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "s",
@@ -41,7 +41,7 @@ type MinkowskiMetric struct {
 
 func NewMinkowskiMetric() MinkowskiMetric {
 	sym, _ := kernel.NewSymbol("eta")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "eta",
@@ -65,7 +65,7 @@ func NewRestMass() RestMass {
 	sym, _ := kernel.NewSymbol("m")
 	mNonNegExpr := kernel.NewRelation(kernel.RelationGte, kernel.NewSymbolMust("m"), kernel.NewRational(big.NewRat(0, 1)))
 	mNonNeg := kernel.NewExprAssumptionMust(kernel.AssumptionConstraint, "rest_mass_nonnegative", mNonNegExpr)
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "m",
@@ -87,7 +87,7 @@ type Energy struct {
 
 func NewEnergy() Energy {
 	sym, _ := kernel.NewSymbol("E")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "E",
@@ -109,7 +109,7 @@ type ThreeMomentum struct {
 
 func NewThreeMomentum() ThreeMomentum {
 	sym, _ := kernel.NewSymbol("p")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "p",
@@ -131,7 +131,7 @@ type FourMomentum struct {
 
 func NewFourMomentum() FourMomentum {
 	sym, _ := kernel.NewSymbol("P")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "P",
@@ -155,7 +155,7 @@ func NewSpeedOfLight() SpeedOfLight {
 	sym, _ := kernel.NewSymbol("c")
 	cPosExpr := kernel.NewRelation(kernel.RelationGt, kernel.NewSymbolMust("c"), kernel.NewRational(big.NewRat(0, 1)))
 	cPos := kernel.NewExprAssumptionMust(kernel.AssumptionConstraint, "speed_of_light_positive", cPosExpr)
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "c",
@@ -177,7 +177,7 @@ type Velocity struct {
 
 func NewVelocity() Velocity {
 	sym, _ := kernel.NewSymbol("v")
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "v",
@@ -192,12 +192,12 @@ func NewVelocity() Velocity {
 	return Velocity{obj}
 }
 
-// CoreObject returns the underlying kernel.Object.
-func (s Spacetime) CoreObject() kernel.Object       { return s.Object }
-func (m MinkowskiMetric) CoreObject() kernel.Object { return m.Object }
-func (m RestMass) CoreObject() kernel.Object        { return m.Object }
-func (e Energy) CoreObject() kernel.Object          { return e.Object }
-func (p ThreeMomentum) CoreObject() kernel.Object   { return p.Object }
-func (p FourMomentum) CoreObject() kernel.Object    { return p.Object }
-func (c SpeedOfLight) CoreObject() kernel.Object    { return c.Object }
-func (v Velocity) CoreObject() kernel.Object        { return v.Object }
+// CoreObject returns the underlying core.Object.
+func (s Spacetime) CoreObject() core.Object       { return s.Object }
+func (m MinkowskiMetric) CoreObject() core.Object { return m.Object }
+func (m RestMass) CoreObject() core.Object        { return m.Object }
+func (e Energy) CoreObject() core.Object          { return e.Object }
+func (p ThreeMomentum) CoreObject() core.Object   { return p.Object }
+func (p FourMomentum) CoreObject() core.Object    { return p.Object }
+func (c SpeedOfLight) CoreObject() core.Object    { return c.Object }
+func (v Velocity) CoreObject() core.Object        { return v.Object }

@@ -2,7 +2,11 @@ package ops
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math/big"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -541,19 +545,23 @@ func TestNoPanicOnMRCViolation(t *testing.T) {
 	}{
 		{"dimension Add", func() error { _, err := Add(energy, length); return err }},
 		{"dimension Compare", func() error {
-			_, err := Compare(energy, length, core.RelationGt); return err
+			_, err := Compare(energy, length, core.RelationGt)
+			return err
 		}},
 		{"kind Add", func() error { _, err := Add(mass, restMass); return err }},
 		{"kind SelectBranch", func() error {
-			_, err := SelectBranch(energy, g.rel); return err
+			_, err := SelectBranch(energy, g.rel)
+			return err
 		}},
 		{"assumption conflict", func() error {
-			_, err := Add(conflictA, conflictB); return err
+			_, err := Add(conflictA, conflictB)
+			return err
 		}},
 		{"convention conflict", func() error { _, err := Add(convA, convB); return err }},
 		{"zero object", func() error { _, err := Simplify(zero); return err }},
 		{"0^0", func() error {
-			_, err := simpExpr(t, core.NewPow(rat(0, 1), big.NewRat(0, 1))); return err
+			_, err := simpExpr(t, core.NewPow(rat(0, 1), big.NewRat(0, 1)))
+			return err
 		}},
 		{"nil exponent", func() error { _, err := Pow(energy, nil); return err }},
 		{"solve form", func() error { _, err := Solve(energy, g.energy); return err }},
@@ -563,7 +571,8 @@ func TestNoPanicOnMRCViolation(t *testing.T) {
 			return err
 		}},
 		{"dispatch unknown id", func() error {
-			_, err := Apply("nope", nil, OperationParams{Kind: "empty"}); return err
+			_, err := Apply("nope", nil, OperationParams{Kind: "empty"})
+			return err
 		}},
 	}
 	for _, v := range violations {
@@ -617,5 +626,188 @@ func TestDispatchClosed(t *testing.T) {
 			t.Errorf("duplicate id %q", id)
 		}
 		seen[id] = true
+	}
+}
+
+// TestMalformedNoPanicBattery (Gate A): every malformed operation shape must
+// yield a typed error, never a panic. Each case runs under recover().
+func TestMalformedNoPanicBattery(t *testing.T) {
+	a := exprObj(t, core.DimensionEnergy(), sym(t, "x"))
+	b := exprObj(t, core.DimensionEnergy(), sym(t, "y"))
+	nonSymVar := exprObj(t, core.Dimensionless(), core.NewAdd(sym(t, "x"), rat(1, 1)))
+	rel, err := Compare(a, b, core.RelationEq)
+	if err != nil {
+		t.Fatalf("fixture relation: %v", err)
+	}
+	oneBranch := mintSpec(t, kernel.ObjectSpec{
+		Name: "", Kind: core.KindBranchSet, Dimension: core.DimensionEnergy(),
+		Expr:        core.NewBranchSet(sym(t, "E"), core.NewSqrt(sym(t, "s"))),
+		Assumptions: core.NewAssumptionSet(), Conventions: core.NewConventionSet(),
+		Provenance:   newProv(t, core.StatusDerived, "test", "test", nil, ""),
+		CorpusStatus: kernel.CorpusNone,
+	})
+	badNeg := mintSpec(t, kernel.ObjectSpec{
+		Name: "", Kind: core.KindBranchSet, Dimension: core.DimensionEnergy(),
+		Expr:        core.NewBranchSet(sym(t, "E"), core.NewSqrt(sym(t, "s")), core.NewSqrt(sym(t, "q"))),
+		Assumptions: core.NewAssumptionSet(), Conventions: core.NewConventionSet(),
+		Provenance:   newProv(t, core.StatusDerived, "test", "test", nil, ""),
+		CorpusStatus: kernel.CorpusNone,
+	})
+	relKindNonRelExpr := mintSpec(t, kernel.ObjectSpec{
+		Name: "", Kind: core.KindRelation, Dimension: core.DimensionEnergy(),
+		Expr:        sym(t, "E"),
+		Assumptions: core.NewAssumptionSet(), Conventions: core.NewConventionSet(),
+		Provenance:   newProv(t, core.StatusDerived, "test", "test", nil, ""),
+		CorpusStatus: kernel.CorpusNone,
+	})
+	neq, err := Compare(a, b, core.RelationNeq)
+	if err != nil {
+		t.Fatalf("fixture neq: %v", err)
+	}
+	nonzero, err := Compare(
+		exprObj(t, core.Dimensionless(), sym(t, "E")),
+		exprObj(t, core.Dimensionless(), rat(1, 1)), core.RelationGte)
+	if err != nil {
+		t.Fatalf("fixture nonzero: %v", err)
+	}
+	wrongTarget, err := Compare(
+		defined(t, core.KindEnergy, core.DimensionEnergy(), sym(t, "F"), "F"),
+		defined(t, core.KindEnergy, core.DimensionEnergy(), rat(0, 1), "z"), core.RelationGte)
+	if err != nil {
+		t.Fatalf("fixture wrongTarget: %v", err)
+	}
+	cases := []struct {
+		name string
+		fn   func() (core.Object, error)
+	}{
+		{"apply wrong arity", func() (core.Object, error) {
+			return Apply(OpAdd, []core.Object{a}, OperationParams{Kind: "empty"})
+		}},
+		{"apply unknown operation", func() (core.Object, error) {
+			return Apply(OperationID("bogus"), []core.Object{a, b}, OperationParams{Kind: "empty"})
+		}},
+		{"apply invalid object", func() (core.Object, error) {
+			return Apply(OpAdd, []core.Object{core.Object{}, core.Object{}}, OperationParams{Kind: "empty"})
+		}},
+		{"substitute non-symbol variable", func() (core.Object, error) {
+			return Substitute(a, nonSymVar, exprObj(t, core.Dimensionless(), sym(t, "z")))
+		}},
+		{"differentiate non-symbol wrt", func() (core.Object, error) {
+			return Differentiate(a, nonSymVar)
+		}},
+		{"limit non-symbol variable", func() (core.Object, error) {
+			return Limit(
+				exprObj(t, core.Dimensionless(), core.NewAdd(sym(t, "x"), rat(2, 1))),
+				nonSymVar,
+				exprObj(t, core.Dimensionless(), rat(3, 1)))
+		}},
+		{"solve non-relation input", func() (core.Object, error) {
+			return Solve(a, b)
+		}},
+		{"solve relation-kind non-relation expr", func() (core.Object, error) {
+			return Solve(relKindNonRelExpr, b)
+		}},
+		{"solve non-quadratic shape", func() (core.Object, error) {
+			return Solve(rel, b)
+		}},
+		{"selectbranch non-branchset", func() (core.Object, error) {
+			return SelectBranch(a, neq)
+		}},
+		{"selectbranch wrong branch count", func() (core.Object, error) {
+			return SelectBranch(oneBranch, neq)
+		}},
+		{"selectbranch bad negation", func() (core.Object, error) {
+			return SelectBranch(badNeg, neq)
+		}},
+		{"selectbranch non-gte operator", func() (core.Object, error) {
+			g, gerr := buildGoldenForBattery(t)
+			if gerr != nil {
+				return core.Object{}, gerr
+			}
+			return SelectBranch(g, neq)
+		}},
+		{"selectbranch wrong target", func() (core.Object, error) {
+			g, gerr := buildGoldenForBattery(t)
+			if gerr != nil {
+				return core.Object{}, gerr
+			}
+			return SelectBranch(g, wrongTarget)
+		}},
+		{"selectbranch nonzero value", func() (core.Object, error) {
+			g, gerr := buildGoldenForBattery(t)
+			if gerr != nil {
+				return core.Object{}, gerr
+			}
+			return SelectBranch(g, nonzero)
+		}},
+	}
+	for _, tc := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("%s panicked: %v", tc.name, r)
+				}
+			}()
+			if _, err := tc.fn(); err == nil {
+				t.Errorf("%s: expected typed error, got nil", tc.name)
+			}
+		}()
+	}
+}
+
+// buildGoldenForBattery returns a well-formed solved BranchSet fixture.
+func buildGoldenForBattery(t *testing.T) (core.Object, error) {
+	t.Helper()
+	r, err := Compare(
+		exprObj(t, core.DimensionEnergy(), core.NewPow(sym(t, "E"), big.NewRat(2, 1))),
+		exprObj(t, core.DimensionEnergy(), rat(4, 1)), core.RelationEq)
+	if err != nil {
+		return core.Object{}, err
+	}
+	return Solve(r, defined(t, core.KindEnergy, core.DimensionEnergy(), sym(t, "E"), "E"))
+}
+
+// TestLorentzBodyClusterOnly (Gate H2 ops side): single-character symbol
+// literals in production ops code may occur only inside lorentzFactorBody.
+// Generic machinery must not dispatch on physics symbol names.
+func TestLorentzBodyClusterOnly(t *testing.T) {
+	fset := token.NewFileSet()
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, decl := range f.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				for _, arg := range call.Args {
+					lit, ok := arg.(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						continue
+					}
+					val := strings.Trim(lit.Value, `"`)
+					if len(val) == 1 && val[0] >= 'A' && (val[0] <= 'Z' || val[0] >= 'a') {
+						if fn.Name.Name != "lorentzFactorBody" {
+							t.Errorf("physics symbol literal %q outside lorentzFactorBody (%s)", val, name)
+						}
+					}
+				}
+				return true
+			})
+		}
 	}
 }

@@ -338,3 +338,156 @@ func TestCandidateDerivationHashMatchesLedger(t *testing.T) {
 		t.Errorf("candidate canonical JSON lacks schema_version")
 	}
 }
+
+// TestReverseConstructorAllowlist (Gate C): hypothesis package exposes only
+// the pinned candidate-concept constructor (HYPOTHESIS/NONE, never ESTABLISHED).
+func TestReverseConstructorAllowlist(t *testing.T) {
+	h, err := hypothesis.NewCandidateConcept("allowlist", core.KindExpression, core.Dimensionless(), mustSymbol(t, "a"))
+	if err != nil {
+		t.Fatalf("concept: %v", err)
+	}
+	if h.Provenance().Status() != core.StatusHypothesis || h.CorpusStatus() != core.CorpusNone {
+		t.Fatalf("concept must be HYPOTHESIS/NONE, got %v/%v", h.Provenance().Status(), h.CorpusStatus())
+	}
+}
+
+// TestNoCrossFrameworkLeakage (Gate H4, both directions, data-driven):
+// forbidden-key sets derive from the manifests themselves; ops derivations
+// from each framework's objects must not carry the other framework's keys.
+// Hypothesis assumptions stay hypothesis-associated.
+func TestNoCrossFrameworkLeakage(t *testing.T) {
+	keysOf := func(raw []byte) map[string]bool {
+		var m struct {
+			Assumptions []struct {
+				Key string `json:"key"`
+			} `json:"assumptions"`
+			Items []struct {
+				Assumptions []struct {
+					Key string `json:"key"`
+				} `json:"assumptions"`
+			} `json:"items"`
+		}
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("manifest decode: %v", err)
+		}
+		ks := map[string]bool{}
+		for _, a := range m.Assumptions {
+			ks[a.Key] = true
+		}
+		for _, it := range m.Items {
+			for _, a := range it.Assumptions {
+				ks[a.Key] = true
+			}
+		}
+		return ks
+	}
+	mechKeys := keysOf(mechanics.ManifestJSON)
+	relKeys := keysOf(relativity.ManifestJSON)
+	relOnly := map[string]bool{}
+	for k := range relKeys {
+		if !mechKeys[k] {
+			relOnly[k] = true
+		}
+	}
+	mechOnly := map[string]bool{}
+	for k := range mechKeys {
+		if !relKeys[k] {
+			mechOnly[k] = true
+		}
+	}
+	assertDisjoint := func(o core.Object, forbidden map[string]bool, side string) {
+		t.Helper()
+		for _, a := range o.Assumptions().Values() {
+			if forbidden[a.Key()] {
+				t.Errorf("%s result carries forbidden %s-framework key %q", side, side, a.Key())
+			}
+		}
+	}
+	m := mechanics.NewMass()
+	mm, err := ops.Add(m.CoreObject(), m.CoreObject())
+	if err != nil {
+		t.Fatalf("mechanics add: %v", err)
+	}
+	assertDisjoint(mm, relOnly, "mechanics")
+	e := relativity.NewEnergy().CoreObject()
+	ee, err := ops.Add(e, e)
+	if err != nil {
+		t.Fatalf("relativity add: %v", err)
+	}
+	assertDisjoint(ee, mechOnly, "relativity")
+	h, err := hypothesis.NewCandidateConcept("leak", core.KindExpression, core.Dimensionless(), mustSymbol(t, "q"))
+	if err != nil {
+		t.Fatalf("concept: %v", err)
+	}
+	if h.Provenance().Status() != core.StatusHypothesis {
+		t.Fatalf("concept status = %v", h.Provenance().Status())
+	}
+}
+
+// TestInvalidCandidateExpressions (Gate E): a trusted candidate carrying an
+// invalid embedded expression handle must fail sealing. Structural validity
+// only — no truth judgment.
+func TestInvalidCandidateExpressions(t *testing.T) {
+	sealWith := func(t *testing.T, id string, mutate func(*session.DraftMetadata)) error {
+		t.Helper()
+		h, err := hypothesis.NewCandidateConcept(id+"_h", core.KindEnergy, core.DimensionEnergy(), mustSymbol(t, "E"))
+		if err != nil {
+			t.Fatalf("concept: %v", err)
+		}
+		eSym := mustSymbol(t, "E")
+		meta := session.DraftMetadata{
+			DerivationID: id,
+			Hypothesis:   h,
+			Premises:     []core.Object{relativity.NewEnergy().CoreObject()},
+			Assumptions:  core.NewAssumptionSet(),
+			Predictions: []session.Prediction{{
+				ID: "hp1", Observable: "E",
+				Relation:    core.NewRelation(core.RelationEq, eSym, eSym),
+				Assumptions: core.NewAssumptionSet(),
+			}},
+			FalsificationConditions: []session.FalsificationCondition{{
+				ID: "hf1", TargetClaim: "hp1",
+				ContradictingCondition: core.NewRelation(core.RelationNeq, eSym, eSym),
+				Regime:                 "lab",
+			}},
+			RecoveryClaims: []session.RecoveryClaim{{
+				ID: "hr1", Description: "rec", FromFramework: "classical_mechanics",
+				Condition: core.NewRelation(core.RelationEq, eSym, eSym),
+			}},
+		}
+		mutate(&meta)
+		s := session.New()
+		if err := s.Draft(id, "invalid expr", meta); err != nil {
+			t.Fatalf("draft: %v", err)
+		}
+		energy := relativity.NewEnergy().CoreObject()
+		if err := s.Declare("energy", energy); err != nil {
+			t.Fatalf("declare: %v", err)
+		}
+		mixed, err := s.Step("mix", ops.OpAdd, []core.Object{h, h}, ops.OperationParams{Kind: "empty"})
+		if err != nil {
+			t.Fatalf("step: %v", err)
+		}
+		if err := s.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		if err := s.Conclude(mixed); err != nil {
+			t.Fatalf("conclude: %v", err)
+		}
+		_, err = s.Seal()
+		return err
+	}
+	cases := []struct {
+		name   string
+		mutate func(*session.DraftMetadata)
+	}{
+		{"prediction", func(m *session.DraftMetadata) { m.Predictions[0].Relation = core.Expr{} }},
+		{"falsification", func(m *session.DraftMetadata) { m.FalsificationConditions[0].ContradictingCondition = core.Expr{} }},
+		{"recovery", func(m *session.DraftMetadata) { m.RecoveryClaims[0].Condition = core.Expr{} }},
+	}
+	for _, tc := range cases {
+		if err := sealWith(t, "invalidexpr_"+tc.name, tc.mutate); err == nil {
+			t.Errorf("%s: Seal with invalid embedded expression must fail", tc.name)
+		}
+	}
+}

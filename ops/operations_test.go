@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"encoding/json"
 	"errors"
 	"math/big"
 	"os"
@@ -376,7 +377,7 @@ func TestApplyPositionalInputs(t *testing.T) {
 }
 
 func TestParamsCanonicalRoundTrip(t *testing.T) {
-	canonical := `{"kind":"pow","exponent":"2/1","operator":"eq","justification":""}`
+	canonical := `{"kind":"pow","exponent":"2/1","operator":"","justification":""}`
 	p, err := ParseOperationParams([]byte(canonical))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -391,7 +392,7 @@ func TestParamsCanonicalRoundTrip(t *testing.T) {
 
 	variants := []string{
 		`{"kind":"empty","exponent":"","operator":"","justification":""}`,
-		`{"kind":"pow","exponent":"-3/4","operator":"eq","justification":""}`,
+		`{"kind":"pow","exponent":"-3/4","operator":"","justification":""}`,
 		`{"kind":"compare","exponent":"","operator":"gte","justification":""}`,
 		`{"kind":"identify","exponent":"","operator":"","justification":"because"}`,
 	}
@@ -411,6 +412,15 @@ func TestParamsCanonicalRoundTrip(t *testing.T) {
 
 	reject := []string{
 		`{"kind":"pow","exponent":"2/1","operator":"eq","justification":"","extra":1}`,
+		`{"kind":"pow","exponent":"2/1","operator":"eq","justification":""}`,
+		`{"kind":"pow","exponent":"2/1","operator":"","justification":"why"}`,
+		`{"kind":"compare","exponent":"2/1","operator":"eq","justification":""}`,
+		`{"kind":"compare","exponent":"","operator":"eq","justification":"why"}`,
+		`{"kind":"empty","exponent":"1/1","operator":"","justification":""}`,
+		`{"kind":"empty","exponent":"","operator":"eq","justification":""}`,
+		`{"kind":"empty","exponent":"","operator":"","justification":"why"}`,
+		`{"kind":"identify","exponent":"2/1","operator":"","justification":"because"}`,
+		`{"kind":"identify","exponent":"","operator":"eq","justification":"because"}`,
 		`{"kind":"nope","exponent":"","operator":"","justification":""}`,
 		`{"kind":"pow","exponent":"4/2","operator":"","justification":""}`,
 		`{"kind":"pow","exponent":"2.5","operator":"","justification":""}`,
@@ -1477,4 +1487,309 @@ func TestLimitDirectSubstitutionNonUnity(t *testing.T) {
 	if got := len(out.Provenance().ParentHashes()); got != 3 {
 		t.Fatalf("parent hashes = %d, want 3 (target, variable, value)", got)
 	}
+}
+
+// TestProvenanceMatrix12 (Gate B): the §13.2 law over all 12 pure operations —
+// clean inputs → DERIVED, any HYPOTHESIS input → HYPOTHESIS, never
+// IDENTIFIED/POSTULATED/DEFINED. (Session.Identify halves live in the K tests:
+// TestSessionIdentifyRecords + TestHypothesisContamination.)
+func TestProvenanceMatrix12(t *testing.T) {
+	x := sym(t, "x")
+	y := sym(t, "y")
+	clean := func(e core.Expr) core.Object {
+		return exprObj(t, core.Dimensionless(), e)
+	}
+	hypo := func(e core.Expr) core.Object {
+		return hypoObj(t, core.KindExpression, core.Dimensionless(), e)
+	}
+	mkSolvePair := func(h core.Object) (core.Object, core.Object) {
+		rel, err := Compare(
+			exprObj(t, core.Dimensionless(), core.NewPow(sym(t, "E"), big.NewRat(2, 1))),
+			h, core.RelationEq)
+		if err != nil {
+			t.Fatalf("solve relation: %v", err)
+		}
+		tgt := defined(t, core.KindExpression, core.Dimensionless(), sym(t, "E"), "E")
+		return rel, tgt
+	}
+	mkBranches := func() (core.Object, core.Object) {
+		r, err := Compare(
+			exprObj(t, core.Dimensionless(), core.NewPow(sym(t, "E"), big.NewRat(2, 1))),
+			exprObj(t, core.Dimensionless(), rat(4, 1)), core.RelationEq)
+		if err != nil {
+			t.Fatalf("branch relation: %v", err)
+		}
+		br, err := Solve(r, defined(t, core.KindExpression, core.Dimensionless(), sym(t, "E"), "E"))
+		if err != nil {
+			t.Fatalf("branch solve: %v", err)
+		}
+		lo, err := Compare(
+			exprObj(t, core.Dimensionless(), sym(t, "E")),
+			exprObj(t, core.Dimensionless(), rat(0, 1)), core.RelationGte)
+		if err != nil {
+			t.Fatalf("branch constraint: %v", err)
+		}
+		return br, lo
+	}
+	br, lo := mkBranches()
+	type opcase struct {
+		name  string
+		clean func() (core.Object, error)
+		hypo  func() (core.Object, error)
+	}
+	cases := []opcase{
+		{"add", func() (core.Object, error) { return Add(clean(x), clean(y)) },
+			func() (core.Object, error) { return Add(hypo(x), clean(y)) }},
+		{"subtract", func() (core.Object, error) { return Subtract(clean(x), clean(y)) },
+			func() (core.Object, error) { return Subtract(clean(x), hypo(y)) }},
+		{"multiply", func() (core.Object, error) { return Multiply(clean(x), clean(y)) },
+			func() (core.Object, error) { return Multiply(hypo(x), hypo(y)) }},
+		{"divide", func() (core.Object, error) { return Divide(clean(x), clean(y)) },
+			func() (core.Object, error) { return Divide(hypo(x), clean(y)) }},
+		{"pow", func() (core.Object, error) { return Pow(clean(x), big.NewRat(2, 1)) },
+			func() (core.Object, error) { return Pow(hypo(x), big.NewRat(2, 1)) }},
+		{"simplify", func() (core.Object, error) { return Simplify(clean(core.NewAdd(x, rat(0, 1)))) },
+			func() (core.Object, error) { return Simplify(hypo(x)) }},
+		{"substitute", func() (core.Object, error) {
+			return Substitute(clean(core.NewAdd(x, rat(1, 1))), clean(x), clean(y))
+		}, func() (core.Object, error) {
+			return Substitute(hypo(core.NewAdd(x, rat(1, 1))), clean(x), clean(y))
+		}},
+		{"differentiate", func() (core.Object, error) { return Differentiate(clean(x), clean(x)) },
+			func() (core.Object, error) { return Differentiate(hypo(x), clean(x)) }},
+		{"limit", func() (core.Object, error) {
+			return Limit(clean(core.NewAdd(x, rat(2, 1))), clean(x), clean(rat(3, 1)))
+		}, func() (core.Object, error) {
+			return Limit(hypo(core.NewAdd(x, rat(2, 1))), clean(x), clean(rat(3, 1)))
+		}},
+		{"compare", func() (core.Object, error) { return Compare(clean(x), clean(y), core.RelationEq) },
+			func() (core.Object, error) { return Compare(hypo(x), clean(y), core.RelationEq) }},
+		{"solve", func() (core.Object, error) {
+			r, g := mkSolvePair(clean(rat(0, 1)))
+			return Solve(r, g)
+		}, func() (core.Object, error) {
+			r, g := mkSolvePair(hypo(rat(0, 1)))
+			return Solve(r, g)
+		}},
+		{"select_branch", func() (core.Object, error) { return SelectBranch(br, lo) },
+			func() (core.Object, error) {
+				hypoBr, err := Solve(func() core.Object {
+					r, rerr := Compare(
+						exprObj(t, core.Dimensionless(), core.NewPow(sym(t, "E"), big.NewRat(2, 1))),
+						hypo(rat(4, 1)), core.RelationEq)
+					if rerr != nil {
+						t.Fatalf("hypo branch relation: %v", rerr)
+					}
+					return r
+				}(), defined(t, core.KindExpression, core.Dimensionless(), sym(t, "E"), "E"))
+				if err != nil {
+					return core.Object{}, err
+				}
+				return SelectBranch(hypoBr, lo)
+			}},
+	}
+	if len(cases) != 12 {
+		t.Fatalf("matrix covers %d ops, want 12", len(cases))
+	}
+	for _, tc := range cases {
+		got, err := tc.clean()
+		if err != nil {
+			t.Errorf("%s clean: %v", tc.name, err)
+			continue
+		}
+		if got.Provenance().Status() != core.StatusDerived {
+			t.Errorf("%s clean status = %v, want DERIVED", tc.name, got.Provenance().Status())
+		}
+		hout, err := tc.hypo()
+		if err != nil {
+			t.Errorf("%s hypo: %v", tc.name, err)
+			continue
+		}
+		if hout.Provenance().Status() != core.StatusHypothesis {
+			t.Errorf("%s hypo status = %v, want HYPOTHESIS", tc.name, hout.Provenance().Status())
+		}
+		for _, o := range []core.Object{got, hout} {
+			switch o.Provenance().Status() {
+			case core.StatusIdentified, core.StatusPostulated, core.StatusDefined:
+				t.Errorf("%s manufactured forbidden status %v", tc.name, o.Provenance().Status())
+			}
+		}
+	}
+}
+
+// TestAssumptionSubsetInvariant (Gate H3): per pure operation, output
+// assumption keys ⊆ input keys ∪ operation-generated keys, and inherited
+// assumptions are preserved verbatim (values, not just keys). Generated keys:
+// divide → denominator/*, select_branch → selected_branch/*, all others → ∅.
+func TestAssumptionSubsetInvariant(t *testing.T) {
+	x := sym(t, "x")
+	y := sym(t, "y")
+	ex := func(e core.Expr) core.Object { return exprObj(t, core.Dimensionless(), e) }
+	keySet := func(o core.Object) map[string]core.Assumption {
+		m := map[string]core.Assumption{}
+		for _, a := range o.Assumptions().Values() {
+			m[a.Key()] = a
+		}
+		return m
+	}
+	generated := func(op string, key string) bool {
+		switch op {
+		case "divide":
+			return strings.HasPrefix(key, "denominator/")
+		case "select_branch":
+			return strings.HasPrefix(key, "selected_branch/")
+		}
+		return false
+	}
+	br, lo := mkBranchesForSubset(t)
+	type opcall struct {
+		name   string
+		inputs []core.Object
+		run    func(ins []core.Object) (core.Object, error)
+	}
+	ca, err := core.NewExprAssumption(core.AssumptionConstraint, "carry/x",
+		core.NewRelation(core.RelationEq, sym(t, "x"), rat(0, 1)))
+	if err != nil {
+		t.Fatalf("assumption: %v", err)
+	}
+	carrier, err := addAssumptionForSubset(t, ex(x), ca)
+	if err != nil {
+		t.Fatalf("carrier: %v", err)
+	}
+	carrier2, err := addAssumptionForSubset(t, ex(y), ca)
+	if err != nil {
+		t.Fatalf("carrier2: %v", err)
+	}
+	solveRel, err := Compare(
+		exprObj(t, core.Dimensionless(), core.NewPow(sym(t, "E"), big.NewRat(2, 1))),
+		carrier, core.RelationEq)
+	if err != nil {
+		t.Fatalf("solve relation: %v", err)
+	}
+	solveTgt := defined(t, core.KindExpression, core.Dimensionless(), sym(t, "E"), "E")
+	loWithCarrier, err := addAssumptionForSubset(t, lo, ca)
+	if err != nil {
+		t.Fatalf("constraint carrier: %v", err)
+	}
+	calls := []opcall{
+		{"add", []core.Object{carrier, carrier2}, func(ins []core.Object) (core.Object, error) {
+			return Add(ins[0], ins[1])
+		}},
+		{"subtract", []core.Object{carrier, carrier2}, func(ins []core.Object) (core.Object, error) {
+			return Subtract(ins[0], ins[1])
+		}},
+		{"multiply", []core.Object{carrier, carrier2}, func(ins []core.Object) (core.Object, error) {
+			return Multiply(ins[0], ins[1])
+		}},
+		{"divide", []core.Object{carrier, carrier2}, func(ins []core.Object) (core.Object, error) {
+			return Divide(ins[0], ins[1])
+		}},
+		{"pow", []core.Object{carrier}, func(ins []core.Object) (core.Object, error) {
+			return Pow(ins[0], big.NewRat(2, 1))
+		}},
+		{"simplify", []core.Object{carrier}, func(ins []core.Object) (core.Object, error) {
+			return Simplify(ins[0])
+		}},
+		{"substitute", []core.Object{carrier, ex(x), ex(y)}, func(ins []core.Object) (core.Object, error) {
+			return Substitute(ins[0], ins[1], ins[2])
+		}},
+		{"differentiate", []core.Object{carrier, ex(x)}, func(ins []core.Object) (core.Object, error) {
+			return Differentiate(ins[0], ins[1])
+		}},
+		{"limit", []core.Object{carrier, ex(x), ex(rat(3, 1))}, func(ins []core.Object) (core.Object, error) {
+			return Limit(ins[0], ins[1], ins[2])
+		}},
+		{"compare", []core.Object{carrier, carrier2}, func(ins []core.Object) (core.Object, error) {
+			return Compare(ins[0], ins[1], core.RelationEq)
+		}},
+		{"solve", []core.Object{solveRel, solveTgt}, func(ins []core.Object) (core.Object, error) {
+			return Solve(ins[0], ins[1])
+		}},
+		{"select_branch", []core.Object{br, loWithCarrier}, func(ins []core.Object) (core.Object, error) {
+			return SelectBranch(ins[0], ins[1])
+		}},
+	}
+	if len(calls) != 12 {
+		t.Fatalf("subset matrix covers %d ops, want 12", len(calls))
+	}
+	for _, tc := range calls {
+		allowed := map[string]core.Assumption{}
+		for _, in := range tc.inputs {
+			for k, a := range keySet(in) {
+				allowed[k] = a
+			}
+		}
+		// solve/select_branch fixtures build their own inputs; collect from a dry run is
+		// unnecessary — instead verify output keys against the union rule below using
+		// the same inputs where present, and verbatim preservation via carrier cases.
+		out, err := tc.run(tc.inputs)
+		if err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		for k, a := range keySet(out) {
+			if want, ok := allowed[k]; ok {
+				if !assumptionEqualForSubset(want, a) {
+					t.Errorf("%s: inherited assumption %q mutated (value not preserved)", tc.name, k)
+				}
+				continue
+			}
+			if !generated(tc.name, k) {
+				t.Errorf("%s: unrelated generated assumption %q", tc.name, k)
+			}
+		}
+	}
+	// Verbatim preservation across a merge: same key on both inputs survives.
+	m1, err := Add(carrier, carrier2)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	got := keySet(m1)["carry/x"]
+	if !assumptionEqualForSubset(ca, got) {
+		t.Errorf("merged assumption not verbatim")
+	}
+}
+
+func mkBranchesForSubset(t *testing.T) (core.Object, core.Object) {
+	t.Helper()
+	r, err := Compare(
+		exprObj(t, core.Dimensionless(), core.NewPow(sym(t, "E"), big.NewRat(2, 1))),
+		exprObj(t, core.Dimensionless(), rat(4, 1)), core.RelationEq)
+	if err != nil {
+		t.Fatalf("branch relation: %v", err)
+	}
+	br, err := Solve(r, defined(t, core.KindExpression, core.Dimensionless(), sym(t, "E"), "E"))
+	if err != nil {
+		t.Fatalf("branch solve: %v", err)
+	}
+	lo, err := Compare(
+		exprObj(t, core.Dimensionless(), sym(t, "E")),
+		exprObj(t, core.Dimensionless(), rat(0, 1)), core.RelationGte)
+	if err != nil {
+		t.Fatalf("branch constraint: %v", err)
+	}
+	return br, lo
+}
+
+func addAssumptionForSubset(t *testing.T, o core.Object, a core.Assumption) (core.Object, error) {
+	t.Helper()
+	merged, err := o.Assumptions().Merge(core.NewAssumptionSet(a))
+	if err != nil {
+		return core.Object{}, err
+	}
+	return mintSpec(t, kernel.ObjectSpec{
+		Name: "w", Kind: o.Kind(), Dimension: o.Dimension(), Expr: o.Expr(),
+		Assumptions: merged, Conventions: o.Conventions(),
+		Provenance:   newProv(t, core.StatusDerived, "test", "test", nil, ""),
+		CorpusStatus: kernel.CorpusNone,
+	}), nil
+}
+
+func assumptionEqualForSubset(a, b core.Assumption) bool {
+	x, err1 := json.Marshal(a)
+	y, err2 := json.Marshal(b)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return string(x) == string(y)
 }

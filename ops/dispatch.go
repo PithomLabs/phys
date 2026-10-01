@@ -37,10 +37,10 @@ const (
 // OperationParams has the exact field order and canonical JSON shape of
 // §15.13. Unused fields encode their empty/default values.
 type OperationParams struct {
-	Kind          string              `json:"kind"`
-	Exponent      string              `json:"exponent"`
+	Kind          string                `json:"kind"`
+	Exponent      string                `json:"exponent"`
 	Operator      core.RelationOperator `json:"operator"`
-	Justification string              `json:"justification"`
+	Justification string                `json:"justification"`
 }
 
 // CanonicalJSON encodes the params in canonical form (struct field order).
@@ -85,15 +85,28 @@ func decodeExact(data []byte) error {
 // validateShape enforces the permitted Kind values and the per-kind field
 // binding: pow → Exponent, compare → Operator, identify → Justification,
 // empty → all other fields.
+// Freeze invariant (Plan 8 H6): every OperationParams kind explicitly defines
+// its meaningful fields; every unused field must hold its canonical
+// empty/default value. This keeps canonical parameter encodings unique per
+// operation semantics (spec §15.13; the v2.3 "operator":"eq" pow example is
+// superseded by this operational pin, spec text unchanged).
 func (p OperationParams) validateShape() error {
 	switch p.Kind {
 	case "empty":
-		// No required fields (§15.13 binding: empty covers all other
-		// operations); unused fields are simply never read.
+		if p.Exponent != "" || p.Operator != "" || p.Justification != "" {
+			return core.UnsupportedOperationError{
+				Operation: "params", Reason: "empty params require all empty fields",
+			}
+		}
 	case "pow":
 		if _, err := parseExactRational(p.Exponent); err != nil {
 			return core.UnsupportedOperationError{
 				Operation: "params", Reason: "pow params require an exact rational exponent",
+			}
+		}
+		if p.Operator != "" || p.Justification != "" {
+			return core.UnsupportedOperationError{
+				Operation: "params", Reason: "pow params require empty operator and justification",
 			}
 		}
 	case "compare":
@@ -105,10 +118,20 @@ func (p OperationParams) validateShape() error {
 				Operation: "params", Reason: "compare params require a relation operator",
 			}
 		}
+		if p.Exponent != "" || p.Justification != "" {
+			return core.UnsupportedOperationError{
+				Operation: "params", Reason: "compare params require empty exponent and justification",
+			}
+		}
 	case "identify":
 		if strings.TrimSpace(p.Justification) == "" {
 			return core.UnsupportedOperationError{
 				Operation: "params", Reason: "identify params require a justification",
+			}
+		}
+		if p.Exponent != "" || p.Operator != "" {
+			return core.UnsupportedOperationError{
+				Operation: "params", Reason: "identify params require empty exponent and operator",
 			}
 		}
 	default:

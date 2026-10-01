@@ -1211,3 +1211,88 @@ func TestValidateManifestBytesPure(t *testing.T) {
 		t.Fatalf("core.ValidateManifestBytes failed: %v", err)
 	}
 }
+
+// TestKernelImportIndependence (Gate H1): internal/kernel is the generic
+// substrate — its non-test sources must import zero local packages. This
+// proves architecture (dependency direction), not sandbox security.
+func TestKernelImportIndependence(t *testing.T) {
+	fset := token.NewFileSet()
+	err := filepath.Walk(filepath.Join(moduleRoot(), "internal", "kernel"), func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if err != nil {
+			return err
+		}
+		for _, imp := range f.Imports {
+			p := strings.Trim(imp.Path.Value, `"`)
+			if strings.HasPrefix(p, "github.com/PithomLabs/phys/") {
+				t.Errorf("internal/kernel imports local package %s (%s)", p, path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestKernelPhysicsBoundary (Gate H2, structural per A1): the kernel allowlist
+// verifies mandated declarations, not mere string occurrence. Theory content
+// beyond the closed enums + two mandated identifiers is forbidden.
+func TestKernelPhysicsBoundary(t *testing.T) {
+	if kernel.LorentzFactorFunctionID != "lorentz_factor" {
+		t.Fatalf("LorentzFactorFunctionID = %q", kernel.LorentzFactorFunctionID)
+	}
+	if kernel.KindMinkowski.String() != "MinkowskiMetric" {
+		t.Fatalf("KindMinkowski.String() = %q", kernel.KindMinkowski.String())
+	}
+	denied := []string{
+		"Newton", "Principia", "Einstein", "1905",
+		"special_relativity", "classical_mechanics",
+		"rest_frame", "rest_mass_nonnegative", "speed_of_light_positive",
+		"lorentz_symmetry", "minkowski_spacetime", "no_gravitational_dynamics",
+		"special_relativistic_regime", "metric.signature", "no_gravity",
+		"horizon_problem", "flat_spacetime", "classical_limit",
+		"EnergyMomentumRelation", "MassEnergyRelation", "NewtonSecondLaw",
+	}
+	fset := token.NewFileSet()
+	err := filepath.Walk(filepath.Join(moduleRoot(), "internal", "kernel"), func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			return err
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				val := strings.Trim(lit.Value, `"`)
+				for _, d := range denied {
+					if strings.Contains(val, d) {
+						t.Errorf("kernel theory content %q in string %q (%s)", d, val, path)
+					}
+				}
+			}
+			if id, ok := n.(*ast.Ident); ok {
+				for _, d := range denied {
+					if strings.Contains(id.Name, d) {
+						t.Errorf("kernel theory content %q in identifier %q (%s)", d, id.Name, path)
+					}
+				}
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

@@ -51,9 +51,6 @@ func DimensionMomentum() Dimension { return dim(1, 1, -1) }
 // DimensionEnergy returns M L^2 T^-2.
 func DimensionEnergy() Dimension { return dim(1, 2, -2) }
 
-// DimensionEnergySquared returns M^2 L^4 T^-4.
-func DimensionEnergySquared() Dimension { return dim(2, 4, -4) }
-
 // NewDimension builds a dimension from exact rational exponents for the
 // seven SI base dimensions (M, L, T, I, Θ, N, J).
 func NewDimension(m, l, t, i, theta, n, j *big.Rat) (Dimension, error) {

@@ -1434,3 +1434,35 @@ func TestValidateOperationParamsStage(t *testing.T) {
 		t.Errorf("params-binding failure attributed to wrong stage (want stage 10): %v", err)
 	}
 }
+
+// TestSessionStepNoPartialCommit (Gate A): a failed Session.Step must leave
+// the draft and ledger unchanged — Commit afterwards must behave as if the
+// failed call never happened.
+func TestSessionStepNoPartialCommit(t *testing.T) {
+	s := mustDraft(t, "nopartial")
+	mass := mechanics.NewMass().CoreObject()
+	if _, err := s.Step("bad", ops.OpAdd, []core.Object{mass}, ops.OperationParams{Kind: "empty"}); err == nil {
+		t.Fatal("wrong-arity Step must fail")
+	}
+	if _, err := s.Identify(mass, mass, "   "); err == nil {
+		t.Fatal("empty-justification Identify must fail")
+	}
+	// Draft must be empty: Commit must report empty-draft, not commit one step.
+	var target core.LedgerValidationError
+	if err := s.Commit(); !errors.As(err, &target) {
+		t.Fatalf("Commit after failures = %v, want LedgerValidationError (empty draft)", err)
+	}
+	// The session remains usable.
+	if err := s.Define("mass", mass); err != nil {
+		t.Fatalf("define: %v", err)
+	}
+	if _, err := s.Step("add", ops.OpAdd, []core.Object{mass, mass}, ops.OperationParams{Kind: "empty"}); err != nil {
+		t.Fatalf("step: %v", err)
+	}
+	if err := s.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := len(s.Ledger().Steps()); got != 2 {
+		t.Fatalf("ledger steps = %d, want 2 (no partial append)", got)
+	}
+}

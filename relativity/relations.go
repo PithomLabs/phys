@@ -13,7 +13,7 @@ func LorentzFactor() kernel.Object {
 	call, _ := kernel.NewCall(kernel.LorentzFactorFunctionID, v)
 	cPosExpr := kernel.NewRelation(kernel.RelationGt, kernel.NewSymbolMust("c"), kernel.NewRational(big.NewRat(0, 1)))
 	cPos := kernel.NewExprAssumptionMust(kernel.AssumptionConstraint, "speed_of_light_positive", cPosExpr)
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "LorentzFactor",
@@ -51,7 +51,7 @@ func EnergyMomentumRelation() kernel.Object {
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "EnergyMomentumRelation",
 		Kind:         kernel.KindRelation,
-		Dimension:    core.DimensionEnergySquared(),
+		Dimension:    core.DimensionEnergy().Multiply(core.DimensionEnergy()),
 		Expr:         expr,
 		Assumptions:  kernel.NewAssumptionSet(mNonNeg, cPos),
 		Conventions:  kernel.NewConventionSet(),
@@ -90,7 +90,7 @@ func MassEnergyRelation() kernel.Object {
 // ZeroThreeMomentum returns the zero three-momentum object.
 func ZeroThreeMomentum() kernel.Object {
 	zero := kernel.NewRational(big.NewRat(0, 1))
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "ZeroThreeMomentum",
@@ -108,7 +108,7 @@ func ZeroThreeMomentum() kernel.Object {
 // ZeroEnergy returns the zero energy object.
 func ZeroEnergy() kernel.Object {
 	zero := kernel.NewRational(big.NewRat(0, 1))
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "ZeroEnergy",
@@ -126,7 +126,7 @@ func ZeroEnergy() kernel.Object {
 // ZeroVelocity returns the zero velocity object.
 func ZeroVelocity() kernel.Object {
 	zero := kernel.NewRational(big.NewRat(0, 1))
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Einstein, 1905", "special_relativity",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Special Relativity corpus", "special_relativity",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "ZeroVelocity",

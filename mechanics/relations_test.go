@@ -21,8 +21,8 @@ func TestNewtonSecondLawManifestMatch(t *testing.T) {
 		wantSrc        string
 	}{
 		{"NewtonSecondLaw", NewtonSecondLaw, kernel.KindRelation, core.DimensionForce(), kernel.StatusDefined, "Newton, Principia"},
-		{"MomentumRelation", MomentumRelation, kernel.KindRelation, core.DimensionMomentum(), kernel.StatusDefined, "Newton, Principia"},
-		{"KineticEnergyRelation", KineticEnergyRelation, kernel.KindRelation, core.DimensionEnergy(), kernel.StatusDefined, "Newton, Principia"},
+		{"MomentumRelation", MomentumRelation, kernel.KindRelation, core.DimensionMomentum(), kernel.StatusDefined, "Classical Mechanics corpus"},
+		{"KineticEnergyRelation", KineticEnergyRelation, kernel.KindRelation, core.DimensionEnergy(), kernel.StatusDefined, "Classical Mechanics corpus"},
 	}
 	for _, tc := range tests {
 		obj := tc.fn()
@@ -202,4 +202,35 @@ func jsonOf(t *testing.T, e kernel.Expr) string {
 		t.Fatalf("canonical expr: %v", err)
 	}
 	return string(raw)
+}
+
+// TestNoRelativityLeakage (Gate H4, mechanics side): ops derivations from
+// mechanics objects must carry none of the relativity-only framework keys.
+// Forbidden-intersection form: legitimate accumulation is untouched.
+func TestNoRelativityLeakage(t *testing.T) {
+	relOnly := []string{
+		"rest_frame", "rest_mass_nonnegative", "speed_of_light_positive",
+		"minkowski_spacetime", "lorentz_symmetry", "no_gravitational_dynamics",
+		"special_relativistic_regime",
+	}
+	m := NewMass()
+	v := NewVelocity()
+	k := NewKineticEnergy(m, v)
+	deriv, err := ops.Differentiate(k.CoreObject(), v.CoreObject())
+	if err != nil {
+		t.Fatalf("differentiate: %v", err)
+	}
+	sum, err := ops.Add(m.CoreObject(), m.CoreObject())
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	for _, o := range []kernel.Object{deriv, sum} {
+		for _, a := range o.Assumptions().Values() {
+			for _, rk := range relOnly {
+				if a.Key() == rk {
+					t.Errorf("mechanics result acquired relativity key %q", rk)
+				}
+			}
+		}
+	}
 }

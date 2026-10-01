@@ -36,7 +36,7 @@ func MomentumRelation() kernel.Object {
 	lhs, _ := kernel.NewSymbol("p")
 	rhs := kernel.NewMul(m, v)
 	expr := kernel.NewRelation(kernel.RelationEq, lhs, rhs)
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Newton, Principia", "classical_mechanics",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Classical Mechanics corpus", "classical_mechanics",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "MomentumRelation",
@@ -60,7 +60,7 @@ func KineticEnergyRelation() kernel.Object {
 	lhs, _ := kernel.NewSymbol("K")
 	rhs := kernel.NewMul(half, m, vSq)
 	expr := kernel.NewRelation(kernel.RelationEq, lhs, rhs)
-	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Newton, Principia", "classical_mechanics",
+	prov, _ := kernel.NewProvenance(kernel.StatusDefined, "Classical Mechanics corpus", "classical_mechanics",
 		nil, [32]byte{}, [32]byte{}, kernel.MRCVersion, "")
 	obj, _ := kernel.MintObject(kernel.ObjectSpec{
 		Name:         "KineticEnergyRelation",

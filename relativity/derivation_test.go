@@ -1,7 +1,12 @@
 package relativity
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math/big"
+	"os"
+	"runtime"
 	"testing"
 
 	"github.com/PithomLabs/phys/core"
@@ -185,7 +190,7 @@ func TestEnergyMomentumRelation(t *testing.T) {
 	if rel.Kind() != kernel.KindRelation {
 		t.Fatalf("kind = %v, want Relation", rel.Kind())
 	}
-	if !rel.Dimension().Equal(core.DimensionEnergySquared()) {
+	if !rel.Dimension().Equal(core.DimensionEnergy().Multiply(core.DimensionEnergy())) {
 		t.Fatalf("dimension mismatch: want Energy^2")
 	}
 	for _, key := range []string{"rest_mass_nonnegative", "speed_of_light_positive"} {
@@ -335,4 +340,116 @@ func contains(haystack, needle string) bool {
 		}
 		return false
 	}())
+}
+
+// deriveMassEnergyForOwnership replays the §20 operation chain without golden
+// assertions, returning the final selected object for ownership analysis.
+func deriveMassEnergyForOwnership(t *testing.T) kernel.Object {
+	t.Helper()
+	sym := func(name string) kernel.Expr {
+		e, err := kernel.NewSymbol(name)
+		if err != nil {
+			t.Fatalf("symbol %s: %v", name, err)
+		}
+		return e
+	}
+	mustObj := func(name string, kind kernel.Kind, dim core.Dimension, expr kernel.Expr) kernel.Object {
+		prov, err := kernel.NewProvenance(kernel.StatusDefined, "", "", nil,
+			[32]byte{}, [32]byte{}, kernel.MRCVersion, "")
+		if err != nil {
+			t.Fatalf("provenance: %v", err)
+		}
+		obj, err := kernel.MintObject(kernel.ObjectSpec{
+			Name: name, Kind: kind, Dimension: dim, Expr: expr,
+			Assumptions: kernel.NewAssumptionSet(), Conventions: kernel.NewConventionSet(),
+			Provenance: prov, CorpusStatus: kernel.CorpusNone,
+		})
+		if err != nil {
+			t.Fatalf("mint %s: %v", name, err)
+		}
+		return obj
+	}
+	emr := EnergyMomentumRelation()
+	zeroP := ZeroThreeMomentum()
+	pVar := mustObj("p", kernel.KindThreeMomentum, core.DimensionMomentum(), sym("p"))
+	subst, err := ops.Substitute(emr, pVar, zeroP)
+	if err != nil {
+		t.Fatalf("Substitute: %v", err)
+	}
+	simp, err := ops.Simplify(subst)
+	if err != nil {
+		t.Fatalf("Simplify: %v", err)
+	}
+	eTarget := mustObj("E", kernel.KindEnergy, core.DimensionEnergy(), sym("E"))
+	solved, err := ops.Solve(simp, eTarget)
+	if err != nil {
+		t.Fatalf("Solve: %v", err)
+	}
+	cmp, err := ops.Compare(NewEnergy().CoreObject(), ZeroEnergy(), kernel.RelationGte)
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+	selected, err := ops.SelectBranch(solved, cmp)
+	if err != nil {
+		t.Fatalf("SelectBranch: %v", err)
+	}
+	return selected
+}
+
+// TestFinalAssumptionOwnership (Gate H5): every assumption on the derived
+// m*c² traces to an explicit input object or operation step — none arrives
+// ambiently. Trace: rest_mass_nonnegative + speed_of_light_positive ←
+// EnergyMomentumRelation inputs; rest_frame ← ZeroThreeMomentum via
+// Substitute; selected_branch/* ← SelectBranch operation contract.
+func TestFinalAssumptionOwnership(t *testing.T) {
+	if testing.Short() {
+		t.Skip("ownership requires full derivation")
+	}
+	selected := deriveMassEnergyForOwnership(t)
+	keys := map[string]bool{}
+	for _, a := range selected.Assumptions().Values() {
+		keys[a.Key()] = true
+	}
+	for _, want := range []string{"rest_mass_nonnegative", "speed_of_light_positive", "rest_frame"} {
+		if !keys[want] {
+			t.Errorf("final result lacks traced assumption %q (have %v)", want, keys)
+		}
+	}
+	branch := 0
+	for k := range keys {
+		if len(k) >= 16 && k[:16] == "selected_branch/" {
+			branch++
+		}
+	}
+	if branch != 1 {
+		t.Errorf("want exactly 1 selected_branch/* assumption, have %v", keys)
+	}
+	if len(keys) != 4 {
+		t.Errorf("final assumption keys = %v, want exactly the 4 traced keys", keys)
+	}
+}
+
+// TestDerivationUsesNoStoredResult (E=mc² firewall): derivation_test.go must
+// contain zero non-comment references to MassEnergyRelation — the result must
+// come from the operation pipeline, never corpus retrieval.
+func TestDerivationUsesNoStoredResult(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("caller unavailable")
+	}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	pf, err := parser.ParseFile(fset, file, raw, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ast.Inspect(pf, func(n ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && id.Name == "MassEnergyRelation" {
+			t.Errorf("forbidden reference to MassEnergyRelation at %v", fset.Position(id.Pos()))
+		}
+		return true
+	})
 }
